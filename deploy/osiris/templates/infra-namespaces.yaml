@@ -1,0 +1,89 @@
+{{- /*
+  90-infra-topology.md IN13·IN14 + PodSecurity — infra-* 네임스페이스 프로비저닝.
+
+  `.Values.infraNamespaces`의 각 이름마다 **한 세트**를 만든다: Namespace(그
+  자체 + PodSecurity enforce 라벨) + ResourceQuota(IN13 자원 격리) +
+  default-deny NetworkPolicy(IN14). osiris-api 읽기 Role/RoleBinding은
+  rbac-api.yaml이 같은 목록을 순회해 따로 만든다(§4.3(b)) — 여기서 중복하지
+  않는다.
+
+  ★ 기본값 `infraNamespaces: []` — 지금은 **아무것도 렌더되지 않는다**. 이
+  클러스터에는 아직 infra-* 네임스페이스가 하나도 없는 것이 정직한 상태다
+  (90 §3.1). 이 템플릿의 존재 의미는 "첫 인프라 네임스페이스가 생기는 그
+  순간, IN13(자원 격리)·IN14(default-deny)·PodSecurity가 **자동으로 함께**
+  선다"는 것 — 즉 격리가 자동 상속이 아니라는 T1 경고(k8s NS는 정책 없으면
+  full-allow)를 프로비저닝에 박아 닫는다. 이름 하나를 values에 추가하는 것만으로
+  안전한 인프라 네임스페이스가 선다.
+
+  왜 default-deny인가(IN14): k8s 네임스페이스는 NetworkPolicy가 하나도 없으면
+  **모든 트래픽 허용**이다. 이관된 인프라 워크로드는 "필요한 연결만 명시적으로
+  열고 나머지는 닫힌" 상태가 기본이어야 한다 — 서비스 간 실제 연결은 이관
+  단계에서 서비스별 allow 정책으로 하나씩 추가한다(B+ 단계). DNS만은 열어
+  둔다(파드가 이름 해석조차 못 하면 디버깅이 불가능하고, DNS 자체는 유출
+  벡터가 아니다 — networkpolicy-agents.yaml과 동일 판단).
+*/}}
+{{- range $ns := .Values.infraNamespaces }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns | quote }}
+  labels:
+    {{- include "osiris.commonLabels" $ | nindent 4 }}
+    osiris.dev/infra: "true"
+    # PodSecurity — osiris-agents와 같은 레벨 선택 근거(namespace.yaml 주석)를
+    # 인프라에도 적용하되, 이관 대상은 서드파티 이미지(postgres·nginx·oracle
+    # 등)라 restricted를 enforce하면 상당수가 거부된다. baseline enforce가
+    # 서드파티 워크로드에 맞는 실질 방어선이다(privileged·hostNetwork·hostPath
+    # 차단). 개별 서비스가 baseline조차 못 맞추면 그 네임스페이스만 예외를
+    # 두는 것이 이관 판단의 일부다.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ printf "%s-quota" $ns | quote }}
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "osiris.commonLabels" $ | nindent 4 }}
+spec:
+  hard:
+    requests.cpu: {{ $.Values.resourcequota.infra.requestsCpu | quote }}
+    requests.memory: {{ $.Values.resourcequota.infra.requestsMemory | quote }}
+    limits.cpu: {{ $.Values.resourcequota.infra.limitsCpu | quote }}
+    limits.memory: {{ $.Values.resourcequota.infra.limitsMemory | quote }}
+    pods: {{ $.Values.resourcequota.infra.pods | quote }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ printf "%s-default-deny" $ns | quote }}
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "osiris.commonLabels" $ | nindent 4 }}
+spec:
+  # 이 네임스페이스의 모든 파드에 적용.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Ingress 규칙 없음 = 인바운드 전면 거부(서비스별 allow는 이관 시 추가).
+  ingress: []
+  # Egress: DNS만 허용. 그 외 아웃바운드는 전면 거부 — 인프라 워크로드가
+  # 서로/외부에 닿으려면 이관 단계에서 명시적 allow를 추가해야 한다(IN14).
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}

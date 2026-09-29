@@ -1,0 +1,31 @@
+# TEMPLATE for nats/generated/authorization.conf — the LIVE file is
+# gitignored (like .env and state/) because osiris-orchestrator overwrites
+# it with resolved, literal NATS passwords (platform + per-agent) as soon as
+# it runs — see internal/natsauth/natsauth.go. This .example is the
+# bootstrap seed to restore if the live file is ever deleted:
+#
+#   cp nats/generated/authorization.conf.example nats/generated/authorization.conf
+#
+# before the first `docker compose up`, so nats.conf's `include` has
+# something to parse (osiris-orchestrator overwrites it with the real,
+# resolved content within one reconcile tick of its own boot — see
+# docs/design/IMPLEMENTATION-NOTES.md §17).
+#
+# NOTE: unlike the live file, this template intentionally uses UNQUOTED
+# $VAR references (nats-server env-substitutes those at parse time from the
+# nats container's own environment — NATS_CORE_PASSWORD/
+# NATS_ORCHESTRATOR_PASSWORD, set in docker-compose.yml from .env). A
+# quoted "$VAR" is parsed as a literal string, not substituted — this was
+# reproduced and fixed once already (§17).
+authorization {
+  users: [
+    { user: "osiris-core", password: $NATS_CORE_PASSWORD, permissions: {
+      publish: { allow: ["org.revision", "org.event.>"] }
+      subscribe: { allow: [] }
+    } }
+    { user: "osiris-orchestrator", password: $NATS_ORCHESTRATOR_PASSWORD, permissions: {
+      publish: { allow: ["agent.*.config.reload", "org.event.>"] }
+      subscribe: { allow: ["org.revision"] }
+    } }
+  ]
+}

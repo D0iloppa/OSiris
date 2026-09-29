@@ -1,0 +1,559 @@
+# OSiris [1단계] — docker-compose 플랫폼 골격.
+# 설계: docs/design/10-core-architecture.md §1.7(G1~G10) / §2 / §3 / §4.1
+# 이 파일에는 "코어 서비스"만 있다. 에이전트/조직 정보는 단 한 줄도 없다(G4).
+#
+# 이번 단계에서 실제로 뜨는 것: osiris-gw, neo4j, nats, osiris-egress,
+# osiris-omniroute, osiris-core, osiris-orchestrator
+# 다음 워커가 구현할 것: osiris-api
+#   (아래 파일 하단에 주석으로 자리만 잡아 둠 — 이미지가 없으므로 지금 주석을
+#    해제하면 pull 실패로 전체 up이 막힌다)
+#
+# **이식성(I5 2차 수정, 사용자 지시)**: 이 파일 하나만으로 **외부 네트워크
+# 없이** 기본 설치가 완결된다 — OSiris는 특정 사이트 구성이 아니라 어디서든
+# 설치되는 프레임워크다. `osiris-gw`는 기본적으로 `127.0.0.1`에 직접 포트를
+# 게시해 설치 직후 로컬에서 콘솔/`/omni/`에 닿는다. `osiris-egress`는
+# `osiris-outbound`(이 파일이 직접 만드는, 외부 의존 없는 일반 브리지)로
+# 실제 인터넷에 나간다. 기존 상위 리버스 프록시가
+# 이미 떠 있는 공유 도커 네트워크에 올라타야 하는 배포는 **선택적 오버레이**
+# `docker-compose.dev-net.yml`로 분리했다 — 그 파일의 헤더 주석과
+# `docs/design/10-core-architecture.md` §2(부록: 예시 배포) 참고.
+#
+# 격리(§2.6 DMZ 패턴, 기본 설치 기준):
+#   외부로 나가는 것 = osiris-egress(osiris-outbound 경유) 뿐.
+#   외부에서 들어오는 것 = osiris-gw(127.0.0.1 루프백) 뿐.
+#   나머지는 전부 internal:true 네트워크 안.
+
+networks:
+  # osiris-outbound — osiris-egress의 실제 인터넷 라우팅 전용. 일반
+  # (non-internal) 브리지라 Docker 기본 NAT로 인터넷에 나간다 — 이 프레임워크가
+  # 직접 만드는 네트워크이므로 호스트에 미리 존재하는 어떤 네트워크에도
+  # 의존하지 않는다(이식성). osiris-egress만 여기 붙는다 — 에이전트도,
+  # 다른 어떤 OSiris 컴포넌트도 이 망에 없다(A3: 실제 외부 인터넷 경로는
+  # egress 하나로 좁혀진다).
+  osiris-outbound: {}
+
+  # osiris-public — osiris-gw의 host 포트 게시 전용. 실측(I5 2차 수정):
+  # Docker는 internal:true 네트워크에만 붙은 컨테이너의 host 포트 publish를
+  # 세팅하지 않는다(osiris-omniroute-lo에서 이미 발견한 것과 같은 제약,
+  # IMPLEMENTATION-NOTES I5 §43 참고 — 그때도 지금도 재현됨: `ports:`가
+  # HostConfig.PortBindings에는 기록되지만 실제 바인드가 안 되고 curl은
+  # connection refused). osiris-edge는 계속 internal:true로 남긴다(osiris-gw
+  # ↔ osiris-api 격리 의미는 그대로) — 대신 osiris-gw에 이 non-internal
+  # 망을 하나 더 준다. osiris-omniroute 때와 달리 여기서는 두 번째 인터페이스가
+  # A3 우회 위험을 만들지 않는다 — osiris-gw는 애초에 아웃바운드 호출을
+  # 하지 않는 수동 리버스 프록시이고(nginx, `proxy_pass`만 함), 프로바이더
+  # 자격증명 같은 것도 갖지 않는다.
+  osiris-public: {}
+
+  osiris-edge:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.238.0/24
+
+  osiris-data:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.239.0/24
+
+  osiris-agents:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.240.0/24
+
+  # osiris-llm — 전용 omniroute 인스턴스(§9 LLM 게이트웨이 어댑터, I5 워커)를
+  # osiris-egress와 묶는 내부 네트워크. osiris-omniroute는 여기(에이전트→
+  # egress 경유 도달용)와 osiris-edge(osiris-gw가 /omni/ 를 프록시하기 위한
+  # 도달용, I5 2차 수정 — 서브패스가 요구사항으로 승격되며 추가) 둘에
+  # 이중 홈되지만, osiris-agents에는 붙지 않으므로 에이전트가 직접 도달할
+  # 수는 여전히 없다(§8.3 "도달 가능한 것은 nats·osiris-core:8090·
+  # osiris-egress:3128 셋뿐"이 문자 그대로 유지된다), osiris-egress가 CONNECT
+  # 프록시로만 중계한다. osiris-egress도 여기 이중 홈되어 (a) 에이전트→
+  # osiris-omniroute 프록시 경로와 (b) osiris-omniroute 자신의 실제 LLM
+  # 프로바이더행 아웃바운드(HTTPS_PROXY 경유, IMPLEMENTATION-NOTES I5 §실측
+  # 참고) 양쪽을 이 하나의 네트워크로 처리한다. dev-net 멤버 수는
+  # osiris-gw/osiris-egress 둘로 불변(D10) — 이 네트워크도, osiris-edge도
+  # dev-net이 아니다.
+  #
+  # 호스트 포트는 0개다 — 서브패스(<origin>/omni/)가 실측으로 성립해
+  # (IMPLEMENTATION-NOTES I5 §54) 루프백 브리지(osiris-omniroute-lo, socat)가
+  # 더 이상 필요 없어져 제거했다.
+  osiris-llm:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.241.0/24
+
+volumes:
+  neo4j-data: {}
+  nats-data: {}
+  osiris-omniroute-data: {}
+
+services:
+  # ---------------------------------------------------------------------
+  # osiris-gw — 안정적 이음새(stable seam, §2.3). 기본 설치의 유일한
+  # 인바운드 접점 — 127.0.0.1 루프백에 직접 포트를 게시한다(이식성, I5 2차
+  # 수정). 상위 리버스 프록시를 앞에 두려면
+  # `docker-compose.dev-net.yml` 오버레이로 dev-net 이중 홈을 추가한다 —
+  # 그때도 이 서비스 정의 자체는 바뀌지 않고 오버레이가 `networks:`만
+  # 확장한다(compose 병합 규칙).
+  # ---------------------------------------------------------------------
+  osiris-gw:
+    # 콘솔 SPA(console/dist)를 이미지 레이어에 굽는다 — 이식성(호스트에
+    # Node/npm·사전 `npm run build` 요구 금지) + `docker compose down && up
+    # -d` 재현성. 상세 근거는 gw/Dockerfile 헤더 주석. gw/conf.d·gw/html은
+    # 여전히 호스트 바인드 마운트(아래 volumes)로 손으로 바로 편집 가능하게
+    # 남긴다 — 바뀌는 것은 콘솔 산출물이 새 경로(/usr/share/nginx/console)에
+    # 이미지로 들어온다는 것뿐.
+    build:
+      context: .
+      dockerfile: gw/Dockerfile
+    image: osiris/gw:${TAG}
+    container_name: osiris-gw
+    networks:
+      - osiris-edge
+      - osiris-public
+    ports:
+      # 기본: 로컬호스트에서만 도달 가능. 0.0.0.0 바인드는 절대 하지 않는다
+      # — 인터넷에 노출하려면 사용자가 상위 게이트웨이(오버레이)나 별도
+      # 리버스 프록시를 명시적으로 앞에 둬야 한다.
+      - "127.0.0.1:${OSIRIS_GW_HOST_PORT:-18280}:80"
+    volumes:
+      - ./gw/conf.d:/etc/nginx/conf.d:ro
+      - ./gw/html:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # neo4j — 온톨로지(:D1 조직 의도의 유일한 진실). 에이전트는 도달 불가
+  # (osiris-data 에만 존재, 라우팅 자체가 없음, §2.6).
+  # ---------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.24-community
+    container_name: osiris-neo4j
+    networks:
+      osiris-data:
+        # 컨테이너 이름은 osiris- 접두사(호스트 충돌 방지)를 쓰되, 설계
+        # (§1.2 불변자산 10번)가 못박은 "에이전트/컴포넌트가 아는 호스트명"과
+        # 맞추기 위해 네트워크 별칭으로 bare 이름도 함께 제공한다.
+        aliases: [neo4j]
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:?NEO4J_AUTH must be set in .env, see .env.example}
+      NEO4J_server_memory_pagecache_size: 512m
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j-data:/data
+      - ./neo4j/init:/init:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+    # 호스트 포트 미publish. 관리 접근은 `docker exec osiris-neo4j cypher-shell`.
+
+  # ---------------------------------------------------------------------
+  # nats — JetStream. INBOX/TASKS/TRANSCRIPT/COST 스트림의 기반(§1.2 불변자산).
+  # 불가피한 이중 홈(osiris-data + osiris-agents) — 실질 강제는 NATS ACL이며
+  # 그 ACL은 osiris-orchestrator가 팀 계정을 발급하기 시작해야 의미가 생긴다
+  # (지금은 인증 없음 — docs/design/IMPLEMENTATION-NOTES.md의 알려진 격차).
+  # ---------------------------------------------------------------------
+  nats:
+    image: nats:2.10-alpine
+    container_name: osiris-nats
+    command: ["-c", "/etc/nats/nats.conf"]
+    networks:
+      osiris-data:
+        aliases: [nats]
+      osiris-agents:
+        aliases: [nats]
+    environment:
+      # nats.conf's `include "/etc/nats-dynamic/authorization.conf"` resolves
+      # these via NATS config's native $VAR substitution ONLY at nats-server's
+      # own first parse of the bootstrap default file (nats/generated/
+      # authorization.conf, committed with literal "$NATS_..." references).
+      # Once osiris-orchestrator reconciles once, it overwrites that file with
+      # already-resolved literal passwords and SIGHUPs nats to reload — these
+      # env vars stop mattering after that, but stay set so a `nats -s reload`
+      # replay from the bootstrap default (e.g. after wiping ./nats/generated)
+      # still works.
+      NATS_CORE_PASSWORD: ${NATS_CORE_PASSWORD:?NATS_CORE_PASSWORD must be set in .env}
+      NATS_ORCHESTRATOR_PASSWORD: ${NATS_ORCHESTRATOR_PASSWORD:?NATS_ORCHESTRATOR_PASSWORD must be set in .env}
+    volumes:
+      - nats-data:/data
+      - ./nats:/etc/nats:ro
+      # Read-write for osiris-orchestrator (mounted at the same host path
+      # there), read-only here — nats only ever needs to read its own config.
+      - ./nats/generated:/etc/nats-dynamic:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # osiris-egress — HTTP CONNECT 프록시, 도메인 허용목록 (A3). 어떤 포트도
+  # host에 publish하지 않는다 — 연결을 걸기만 하고 받지 않는다(§2.6).
+  #
+  # I5 2차 수정(이식성): 실제 인터넷 라우팅은 `osiris-outbound`(이 파일이
+  # 직접 만드는 일반 브리지, 외부 네트워크 의존 없음)로 한다 — 예전엔 이
+  # 역할을 호스트의 기존 `dev-net`이 대신했지만, 그건 "이 호스트에 마침
+  # 상위 리버스 프록시가 떠 있어 인터넷 라우팅이 되는 공유망이 있었다"는 우연에
+  # 기댄 것이었다. 이제 dev-net 의존이 전혀 없다 — `osiris-omniroute`가
+  # 전용 인스턴스로 내부화된 뒤(I5) dev-net을 거쳐야 할 목적지가 하나도
+  # 남지 않았기 때문이기도 하다(A10 갱신 참고, §9.0/§11.1).
+  # ---------------------------------------------------------------------
+  osiris-egress:
+    image: ubuntu/squid:6.6-24.04_edge@sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c
+    container_name: osiris-egress
+    networks:
+      - osiris-agents
+      - osiris-outbound
+      # I5: osiris-omniroute용 (에이전트→egress→omniroute 중계 +
+      # omniroute 자신의 아웃바운드 프록시 대상).
+      - osiris-llm
+    volumes:
+      - ./egress/squid.conf:/etc/squid/squid.conf:ro
+    healthcheck:
+      test: ["CMD", "squid", "-k", "check", "-f", "/etc/squid/squid.conf"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # osiris-omniroute — I5 워커. OSiris 프레임워크 전용 LLM 게이트웨이(§9).
+  # 호스트에 따로 떠 있을 수 있는 공용 omniroute는 전혀
+  # 건드리지 않는다 — 별도 컨테이너명·별도 볼륨·별도 네트워크.
+  #
+  # I5 2차 수정(사용자 지시 — 서브패스가 필수 요구사항으로 승격): 벤더의
+  # 사전빌드 이미지(다이제스트 고정)는 Next.js `basePath`가 빌드 타임에만
+  # 굳어 런타임 env로는 서브패스가 안 먹힌다는 것을 먼저 실측으로 확인했다
+  # (10-core-architecture.md §9.7, IMPLEMENTATION-NOTES I5 §54). 그래서
+  # `build: ./omniroute-build`로 **소스에서 직접 재빌드**한다 —
+  # `omniroute-build/Dockerfile`이 그 벤더 다이제스트 하나만을 소스로 삼아
+  # (별도 git clone 없음, 다이제스트가 곧 재현성의 닻) `OMNIROUTE_BASE_PATH=
+  # /omni`만 다르게 준 것 외에는 벤더 자신의 Dockerfile 레시피를 그대로
+  # 따른다. `osiris/agent`(bin/build-agent-image.sh)와 같은 "프레임워크가
+  # 자기 스택 이미지를 빌드한다" 패턴 — `TAG`로 버전 관리.
+  #
+  # 네트워크: osiris-llm(에이전트→egress 경유 도달용, §8.3 불변 — 에이전트는
+  # osiris-agents에 없어 여전히 직접 도달 불가) + osiris-edge(osiris-gw가
+  # `/omni/`를 프록시하기 위한 도달용, I5 2차 수정으로 추가). 둘 다
+  # dev-net이 아니므로 D10(dev-net 멤버는 osiris-gw/osiris-egress 둘로 불변)
+  # 에 영향 없다. 이 컨테이너 자신의 아웃바운드(실제 LLM 프로바이더행)는
+  # osiris-egress를 HTTPS_PROXY/HTTP_PROXY로 사용한다 — A3(전 외부 egress
+  # 프록시 강제)의 예외를 두지 않는 결정. 실측 근거: IMPLEMENTATION-NOTES.md
+  # I5 §42/§9.0.
+  #
+  # 호스트 포트 0개 — 서브패스가 성립해 루프백 브리지(구 osiris-omniroute-lo,
+  # socat)가 필요 없어져 제거했다. 관리 UI는 이제 <origin>/omni/
+  # 로만 접근한다(osiris-gw의 gw/conf.d/default.conf `location /omni/`).
+  # ---------------------------------------------------------------------
+  osiris-omniroute:
+    build: ./omniroute-build
+    image: osiris/omniroute-omni:${TAG}
+    container_name: osiris-omniroute
+    networks:
+      osiris-llm:
+        aliases: [osiris-omniroute]
+      osiris-edge: {}
+    environment:
+      PORT: "20128"
+      DATA_DIR: /app/data
+      # I5 3차 수정(사용자 지적, 재발 방지): 이 값을 :?로 강제하지 않는다 —
+      # 관리자 비밀번호는 온보딩이 결정할 사람 대면 자격증명이고, 설치
+      # 시점에 우리가 미리 발명해 .env에 남길 값이 아니다(프로바이더 키와
+      # 같은 부류 — §9.5). 비워 두면(기본) omniroute 자신의 최초 접속 흐름이
+      # 대신한다 — 실측 확인(managementPassword.ts + login/page.tsx 소스):
+      # 비밀번호가 없으면 `/api/settings/require-login`이 `hasPassword:false`
+      # 를 보고하고 로그인 페이지가 자체 온보딩 화면(`/dashboard/onboarding`)
+      # 으로 안내한다. 값이 있으면(예: 이 저장소를 이미 쓰던 기존 설치) 그
+      # 값으로 그대로 로그인한다 — 기존 세션을 깨지 않기 위해 강제 회전하지
+      # 않는다. 자세한 근거는 IMPLEMENTATION-NOTES.md I5 §65.
+      INITIAL_PASSWORD: ${OSIRIS_OMNIROUTE_ADMIN_PASSWORD:-}
+      # Onboarding's omniroute/operations.mjs needs plaintext re-reads of the
+      # gateway API key it already created (idempotent re-apply) — GET
+      # /api/keys/{id}/reveal is gated behind this flag (off by default
+      # upstream). Only reachable via /omni/ (behind omniroute's own login)
+      # or from inside osiris-llm/osiris-edge, never from dev-net/
+      # osiris-agents, so enabling it here does not widen any external surface.
+      ALLOW_API_KEY_REVEAL: "true"
+      # omniroute's own outbound to real LLM providers goes through
+      # osiris-egress (A3, no exception) — verified to be honoured by
+      # omniroute's bundled fetch patch (open-sse/utils/proxyFetch.ts reads
+      # HTTPS_PROXY/HTTP_PROXY/NO_PROXY when no per-connection proxy is
+      # configured in its DB, which is the default for a fresh instance).
+      HTTPS_PROXY: http://osiris-egress:3128
+      HTTP_PROXY: http://osiris-egress:3128
+      NO_PROXY: localhost,127.0.0.1,osiris-omniroute
+    volumes:
+      - osiris-omniroute-data:/app/data
+    healthcheck:
+      # /healthz -> 404, /api/health -> 401 on this build (re-verified —
+      # IMPLEMENTATION-NOTES I5). /v1/models is unauthenticated 200 and
+      # issues no model call, matching the existing OSIRIS_GATEWAY_HEALTH_PATH
+      # workaround already used by the orchestrator/agent probe. Note the
+      # health probe hits the ROOT path, not /omni/ — basePath only affects
+      # page/asset routing, not this bare backend port.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:20128/omni/v1/models').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # osiris-core — 2단계 워커 구현. Neo4j에 대한 유일한 쓰기 관문(A5/G7/D17).
+  # LLM 호출 없음 — 이미지에 claude 바이너리도 게이트웨이 자격증명도 없다
+  # (A4/D12, core/Dockerfile이 FROM scratch로 강제한다). 배정 엔진/
+  # orchestrator/온보딩 대화는 이번 범위 밖(다음 워커) — core/README 대신
+  # docs/design/IMPLEMENTATION-NOTES.md 참조.
+  # ---------------------------------------------------------------------
+  osiris-core:
+    build: ./core
+    image: osiris/core:${TAG}
+    container_name: osiris-core
+    networks:
+      osiris-data: {}
+      osiris-agents:
+        aliases: [osiris-core]        # §1.2 불변자산 10번의 호스트명
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+      # Embedded userinfo — nats.go's Connect(url) authenticates from this,
+      # no separate creds file needed for a trusted platform component (see
+      # orchestrator/internal/config/config.go's NatsURL comment for why
+      # this differs from agent containers, which get NATS creds via file
+      # injection per G5). Password must equal NATS_CORE_PASSWORD below,
+      # which is what nats/generated/authorization.conf grants it.
+      NATS_URL: nats://osiris-core:${NATS_CORE_PASSWORD:?NATS_CORE_PASSWORD must be set in .env}@nats:4222
+      HEALTH_ADDR: ":8081"
+      API_ADDR: ":8090"
+      CATALOG_VERSION: "2026.08.1"
+      CORE_API_TOKEN: ${CORE_API_TOKEN:?CORE_API_TOKEN must be set in .env}
+      ORG_NAME: ${ORG_NAME:-OSiris}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/osiris-core", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    # 호스트 포트 미publish. :8081(헬스)·:8090(graph-write API)는 osiris-data/
+    # osiris-agents 안에서만 도달 가능. dev-net에는 발을 걸치지 않는다(§2.6).
+
+  # ---------------------------------------------------------------------
+  # osiris-orchestrator — 3단계 워커 구현. WorkloadDriver(DockerDriver) +
+  # 수렴 루프(§1.4/§6.2). Docker Engine API 직접 호출(A11) — 소켓은
+  # 여기에만 마운트한다(G8). 에이전트 네트워크(osiris-agents)에 붙지
+  # 않는다 — 에이전트가 orchestrator에 도달할 경로 자체가 없다. LLM 호출
+  # 없음(A4/D12, Dockerfile이 FROM scratch로 강제) — claude 바이너리도
+  # 게이트웨이 자격증명도 없다.
+  # ---------------------------------------------------------------------
+  osiris-orchestrator:
+    build: ./orchestrator
+    image: osiris/orchestrator:${TAG}
+    container_name: osiris-orchestrator
+    networks:
+      osiris-data: {}                       # ★ 에이전트 네트워크에 붙지 않음
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+      NATS_URL: nats://osiris-orchestrator:${NATS_ORCHESTRATOR_PASSWORD:?NATS_ORCHESTRATOR_PASSWORD must be set in .env}@nats:4222
+      NATS_CORE_PASSWORD: ${NATS_CORE_PASSWORD:?NATS_CORE_PASSWORD must be set in .env}
+      NATS_ORCHESTRATOR_PASSWORD: ${NATS_ORCHESTRATOR_PASSWORD:?NATS_ORCHESTRATOR_PASSWORD must be set in .env}
+      # osiris-api's static NATS user (SSE resume, §7.4/D19) — optional here:
+      # if unset, natsauth.Generator.render simply omits that user (osiris-api
+      # not deployed yet). See orchestrator/internal/natsauth/natsauth.go.
+      NATS_API_PASSWORD: ${NATS_API_PASSWORD:-}
+      NATS_CONTAINER_NAME: osiris-nats
+      NATS_AUTH_CONF_PATH: /etc/nats-dynamic/authorization.conf
+      DOCKER_SOCKET_PATH: /var/run/docker.sock
+      # Host-absolute path to THIS compose project directory. Required
+      # because this container talks to the HOST's dockerd over the mounted
+      # socket — any bind-mount Source it hands to ContainerCreate is
+      # resolved by the HOST daemon against the HOST filesystem, not this
+      # container's own view of ./state (classic docker-out-of-docker
+      # gotcha; see internal/driver/docker/driver.go's hostCredsDir comment).
+      HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?HOST_PROJECT_DIR must be set in .env to the absolute host path of this repo}
+      STATE_DIR: /state
+      CATALOG_VERSION: "2026.08.1"
+      OSIRIS_MAX_RESIDENT_AGENTS: ${OSIRIS_MAX_RESIDENT_AGENTS:-4}
+      # [2026-07-28] osiris-core, for the genesis token issuance of 10 §8.5
+      # steps 4-5. HI11: NEITHER IS A NEW .env VARIABLE — CORE_API_TOKEN is
+      # already required by osiris-core and osiris-api, and CORE_BASE_URL has an
+      # in-compose default exactly as it does for osiris-api. This service simply
+      # had no reason to read them until it had to ask core for a token.
+      CORE_BASE_URL: http://osiris-core:8090
+      CORE_API_TOKEN: ${CORE_API_TOKEN:?CORE_API_TOKEN must be set in .env}
+      # [I4] 에이전트 이미지 폴백 + LLM 게이트웨이 자격증명 "배달" 설정.
+      # G4를 어기지 않는다 — 조직 정보(에이전트 목록·팀·직무)는 여기 없고,
+      # 권위는 여전히 Neo4j의 :AIAgent.image다. 아래는 그 값이 비었을 때의
+      # 폴백과, 모든 에이전트에 공통인 게이트웨이 엔드포인트뿐이다.
+      # A4도 어기지 않는다 — 이 컨테이너는 토큰을 파일로 써서 전달만 하고,
+      # 이미지에는 claude 바이너리도 LLM 클라이언트도 없다(§9.1).
+      OSIRIS_AGENT_IMAGE: ${OSIRIS_AGENT_IMAGE:-osiris/agent:dev}
+      # I5: switched from the shared public omniroute (dev-net) to the
+      # framework-owned osiris-omniroute (osiris-llm, egress-proxied only —
+      # see the osiris-omniroute service comment and IMPLEMENTATION-NOTES I5).
+      OSIRIS_GATEWAY_BASE_URL: ${OSIRIS_GATEWAY_BASE_URL:-http://osiris-omniroute:20128/omni}
+      OSIRIS_GATEWAY_TOKEN: ${OSIRIS_GATEWAY_TOKEN:-}
+      # Code/compose default stays /healthz (the spec's literal contract,
+      # §9.2); /healthz -> 404 on this build too (re-verified, not just the
+      # old public instance — I5), so .env overrides this to /v1/models,
+      # same workaround pattern as before.
+      OSIRIS_GATEWAY_HEALTH_PATH: ${OSIRIS_GATEWAY_HEALTH_PATH:-/healthz}
+      # 내부(compose 망 안) 게이트웨이를 쓸 때만 채운다. 기본값 빈 문자열이므로
+      # 운영 경로는 A3 그대로 — 모든 외부 통신은 osiris-egress 경유다.
+      OSIRIS_AGENT_EXTRA_NO_PROXY: ${OSIRIS_AGENT_EXTRA_NO_PROXY:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # ★ 여기에만 (G8) — 에이전트 컨테이너에는 절대 마운트하지 않는다
+      - ./state:/state
+      - ./nats/generated:/etc/nats-dynamic:rw        # nats와 같은 호스트 경로를 공유(nats는 ro로 마운트)
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      osiris-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/osiris-orchestrator", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    # 호스트 포트 미publish. :8081(헬스/상태)는 osiris-data 안에서만 도달
+    # 가능. dev-net·osiris-agents 어느 쪽에도 발을 걸치지 않는다.
+
+  # ---------------------------------------------------------------------
+  # osiris-api — 6단계 워커 구현. 콘솔 REST/SSE 계약, 온보딩 0단계
+  # (docs/design/30-onboarding-provisioning.md §1.0), GET /onboarding/status,
+  # D19/D20 SSE 재개(§7.4). 배정 엔진/온톨로지 시드(1단계 온보딩 대화)/
+  # 콘솔 SPA는 이번 범위 밖(다음 워커) — api/README 대신
+  # docs/design/IMPLEMENTATION-NOTES.md 참조.
+  #
+  # docker.sock을 갖지 않는다(D4/G8) — 컨테이너 생성은 orchestrator 소관.
+  # Neo4j는 읽기 전용 세션만 연다(api/internal/graphread) — 쓰기는 전부
+  # osiris-core 경유(A5/G7/D17), 이 빌드에서는 osiris-api가 아직 쓰기가
+  # 필요한 콘솔 라우트를 구현하지 않는다.
+  #
+  # 빌드 컨텍스트가 리포 루트인 이유: omniroute/operations.mjs(온보딩
+  # 오퍼레이션의 단일 소스, api/internal/omniroute/ops.go 참고)를
+  # api/ 밖에서 그대로 COPY하기 위함 — api/Dockerfile 헤더 주석 참고.
+  # ---------------------------------------------------------------------
+  osiris-api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: osiris/api:${TAG}
+    container_name: osiris-api
+    networks:
+      osiris-edge:
+        aliases: [osiris-api]     # gw/conf.d/default.conf의 `set $api_up "osiris-api:8443";`가 참조하는 이름
+      osiris-data: {}             # neo4j(읽기 전용)·osiris-orchestrator:8081(0-5 검증용) 도달용
+    environment:
+      HEALTH_ADDR: ":8081"
+      API_ADDR: ":8443"
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN}
+      TRUSTED_PROXY_CIDR: 172.31.238.0/24
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+      NATS_URL: nats://osiris-api:${NATS_API_PASSWORD:?NATS_API_PASSWORD must be set in .env}@nats:4222
+      ORCHESTRATOR_BASE_URL: http://osiris-orchestrator:8081
+      # [2026-07-27] osiris-api's client credential for osiris-core's
+      # graph-write API (D17/G7/A5 — the single write gate). Needed by the org
+      # role model (60-identity-authn.md §20.6): osiris-api holds a READ-ONLY
+      # Neo4j session and performs every write across this HTTP boundary.
+      #
+      # HI11: this is NOT a new .env variable. CORE_API_TOKEN already exists
+      # and is already required by osiris-core and osiris-orchestrator; this
+      # line only routes the existing value to a third consumer. Nothing new
+      # is baked at install time.
+      CORE_BASE_URL: http://osiris-core:8090
+      CORE_API_TOKEN: ${CORE_API_TOKEN:?CORE_API_TOKEN must be set in .env}
+      OSIRIS_GATEWAY_BASE_URL: ${OSIRIS_GATEWAY_BASE_URL:-http://osiris-omniroute:20128/omni}
+      OSIRIS_GATEWAY_HEALTH_PATH: ${OSIRIS_GATEWAY_HEALTH_PATH:-/v1/models}
+      # omniroute/operations.mjs's own env resolution (resolveOpts) — osiris-api
+      # does not re-parse these, it only ensures the subprocess sees them.
+      # Base URL: osiris-api reaches osiris-omniroute directly over osiris-edge
+      # (both are members — see osiris-omniroute's network comment), NOT
+      # through osiris-egress: that proxy's allowlist is for AGENT inference
+      # traffic (§8.3), and this is a platform component's own admin-API call,
+      # not an agent's LLM call.
+      # 외부 omniroute 모드(docker-compose.omniroute-external.yml)에서는 .env가 `/omni` 없는 값으로 덮어쓴다.
+      OSIRIS_OMNIROUTE_BASE_URL: ${OSIRIS_OMNIROUTE_BASE_URL:-http://osiris-omniroute:20128/omni}
+      # Deliberately NOT set here: OSIRIS_OMNIROUTE_ADMIN_PASSWORD. The
+      # password only ever exists as an HTTP request body value, for the
+      # lifetime of one POST /api/onboarding/step0/omniroute-admin call (see
+      # api/internal/onboarding/handlers.go's OmniouteAdmin) — never as a
+      # container env var. See §9.5/§1.0.4 and IMPLEMENTATION-NOTES.md.
+      OSIRIS_OMNIROUTE_MANAGE_KEY: ${OSIRIS_OMNIROUTE_MANAGE_KEY:-}
+      OMNIROUTE_OPERATIONS_SCRIPT: /app/omniroute/operations.mjs
+      NODE_BIN: node
+      ENV_FILE_PATH: /repo-env/.env
+      # The master key (60-identity-authn.md §4.0/H22) and, separately, the
+      # pre-H22 file name it migrates away from. ADMIN_SETUP_TOKEN_PATH is kept
+      # ONLY so masterkey.Boot can find and delete a legacy value on an existing
+      # deployment — it is never accepted as a credential (no `osk_` prefix, so
+      # the prefix-routing guard cannot select a branch for it at all).
+      MASTER_KEY_PATH: /state/creds/admin/master_key
+      ADMIN_SETUP_TOKEN_PATH: /state/creds/admin/setup_token
+    volumes:
+      # Read-write: onboarding step0 needs to reflect the gateway token and
+      # the omniroute manage key back into .env (operations.mjs's
+      # applyGatewayTokenToEnv/applyManageKeyToEnv) — see api/internal/
+      # onboarding/handlers.go. Mounting the whole file (rather than a
+      # narrower secret store) is a deliberate, documented trade-off — see
+      # docs/design/IMPLEMENTATION-NOTES.md's osiris-api section.
+      - ./.env:/repo-env/.env
+      # Narrow mount (not the whole ./state tree osiris-orchestrator owns):
+      # only this one subdirectory, only for the admin setup token
+      # (api/internal/adminauth) — see that package's doc comment for why
+      # this is NOT the §8.5 genesis token.
+      - ./state/creds/admin:/state/creds/admin
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      osiris-omniroute:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt: [no-new-privileges]
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "/osiris-api", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    # 호스트 포트 미publish. osiris-gw(osiris-edge 안)만 :8443에 도달한다.
+    # osiris-agents에는 붙지 않는다 — 에이전트가 이 서비스를 알 이유가
+    # 없다(§8.3의 세 이름 nats/osiris-core:8090/osiris-egress:3128에
+    # osiris-api를 추가하지 않는다).

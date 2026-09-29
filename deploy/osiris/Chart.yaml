@@ -1,0 +1,14 @@
+# OSiris Helm chart — K1: "산출물은 설치 패키지 하나"
+# (docs/design/70-kubernetes-deployment.md §0 K1). 이미지 N개·파드 N개가
+# 있어도 설치 명령은 이 chart 하나 `helm install`뿐이다.
+apiVersion: v2
+name: osiris
+description: >-
+  OSiris 플랫폼(osiris-system: core/api/orchestrator/omniroute/egress/
+  neo4j/nats + osiris-agents: 에이전트 워크로드 네임스페이스 골격)의
+  단일 Helm chart. docs/design/70-kubernetes-deployment.md의 K1~K13을
+  구현한다 — 그 문서가 결정을 소유하고, 이 chart는 그 결정을 렌더링만
+  한다(새 결정을 여기서 발명하지 않는다).
+type: application
+version: 0.1.0
+appVersion: "2026.07"

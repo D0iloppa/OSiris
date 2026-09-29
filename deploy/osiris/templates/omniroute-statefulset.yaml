@@ -1,0 +1,221 @@
+# osiris-omniroute — K1: "osiris-core와 osiris-omniroute는 각자 파드로
+# 남는다" — omniroute가 프로바이더 API 키의 유일한 소유자이므로(§9,
+# 30 O13), 한 이미지/파드에 합치면 그 경계가 소멸한다(§0 K1 근거). §2
+# 배치도가 지정한 대로 StatefulSet + 자체 PVC(/app/data — API 키·설정을
+# 자신의 DB에 보관).
+#
+# nodeAffinity 없음 — K4가 고정을 요구하는 것은 core/neo4j/nats 셋뿐이다
+# (§2 배치도, "코어는 노드 고정"). omniroute는 자기 PVC를 갖지만 코어의
+# "상태 소유권"(Neo4j가 유일한 진실)과는 다른 층이므로 노드 고정 대상이
+# 아니다.
+{{- $external := include "osiris.omnirouteExternal" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  # ★ [2026-07-28 실배포 실측 — 결함 2] 클라이언트용 ClusterIP Service.
+  #
+  # osiris-api/osiris-orchestrator/osiris-egress 모두 이 이름
+  # ("osiris-omniroute")으로 붙는다(OSIRIS_GATEWAY_BASE_URL, squid.conf의
+  # allow_osiris_omniroute acl). headless였을 때는 osiris-omniroute-0이
+  # Ready가 되기 전까지 이름 자체가 없어 neo4j/nats와 같은 성질의 DNS
+  # 실패를 유발할 수 있었다 — 실제로 이 파드는 매번 OOMKilled로 죽어
+  # Ready에 도달하지 못했으므로(결함 4), 그 상태에서 이 이름을 참조하는
+  # 다른 컴포넌트도 함께 실패했을 것이다.
+  name: {{ include "osiris.omnirouteServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: omniroute
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  {{- if not $external }}
+  selector:
+    app.kubernetes.io/component: omniroute
+  {{- end }}
+  ports:
+    - name: http
+      port: 20128
+      targetPort: {{ if $external }}{{ .Values.omniroute.external.port }}{{ else }}20128{{ end }}
+{{- if $external }}
+---
+# omniroute.mode=external — selector 없는 Service의 목적지(외부 omniroute 또는 브리지).
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: {{ include "osiris.omnirouteServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: omniroute
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+subsets:
+  - addresses:
+      - ip: {{ .Values.omniroute.external.ip }}
+    ports:
+      - name: http
+        port: {{ .Values.omniroute.external.port }}
+        protocol: TCP
+{{- else }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # governing headless Service — StatefulSet.spec.serviceName 전용.
+  # neo4j-statefulset.yaml의 동일 패턴 참고.
+  name: {{ include "osiris.omnirouteHeadlessServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: omniroute
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: omniroute
+  ports:
+    - name: http
+      port: 20128
+      targetPort: 20128
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: osiris-omniroute
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: omniroute
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "osiris.omnirouteHeadlessServiceName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: omniroute
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: omniroute
+    spec:
+      containers:
+        - name: omniroute
+          image: "{{ .Values.images.omniroute.repository }}:{{ .Values.images.omniroute.tag }}"
+          imagePullPolicy: {{ .Values.images.omniroute.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 20128
+          env:
+            - name: PORT
+              value: "20128"
+            - name: DATA_DIR
+              value: /app/data
+            # I5 3차 수정 원칙(그대로 계승): 관리자 비밀번호는 사람 대면
+            # 자격증명이라 설치 시점에 미리 발명하지 않는다 — 비워 두면
+            # (기본) omniroute 자신의 최초 접속 흐름이 온보딩 화면으로
+            # 안내한다.
+            - name: INITIAL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: OSIRIS_OMNIROUTE_ADMIN_PASSWORD
+                  optional: true
+            # [2026-09-11 사용자 확정] 루트 키. omniroute는 이 env가 제시된
+            # Bearer와 일치하면 SQLite를 조회하지 않고 manage 스코프로
+            # 통과시킨다(src/lib/db/apiKeys.ts의 isConfiguredEnvApiKey →
+            # validateApiKey :1129 / getApiKeyMetadata :1234). 벤더가
+            # "headless / CI / first-boot" 부트스트랩 경로로 명시해 둔 기능이며,
+            # 설계 근거 전문은 secrets.yaml의 OSIRIS_OMNIROUTE_ROOT_KEY 주석.
+            #
+            # 이것이 온보딩 1단계(관리자 비밀번호 교환)를 통째로 없앤다 —
+            # 사람이 omniroute 비밀번호를 타이핑하는 지점이 사라지고, OSiris는
+            # 그 비밀번호를 한 번도 보지 않는다(31-onboarding-boundary.md
+            # "사건 3" 정정의 취지를 더 강하게 만족시킨다).
+            - name: OMNIROUTE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: OSIRIS_OMNIROUTE_ROOT_KEY
+                  optional: true
+            - name: ALLOW_API_KEY_REVEAL
+              value: "true"
+            # omniroute 자신의 아웃바운드(실제 LLM 프로바이더행)도
+            # osiris-egress를 경유한다 — A3에 예외를 두지 않는 결정(§9.0).
+            - name: HTTPS_PROXY
+              value: "http://{{ include "osiris.egressServiceName" . }}:3128"
+            - name: HTTP_PROXY
+              value: "http://{{ include "osiris.egressServiceName" . }}:3128"
+            - name: NO_PROXY
+              value: "localhost,127.0.0.1,{{ include "osiris.omnirouteServiceName" . }}"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          # /healthz -> 404, /api/health -> 401 (실측, 코드 주석 그대로) —
+          # /omni/v1/models는 무인증 200이고 모델 호출을 유발하지 않는다
+          # (OSIRIS_GATEWAY_HEALTH_PATH의 기존 워크어라운드와 동일).
+          #
+          # ★ [2026-07-28 실배포 실측 — 결함 5 조사 중 발견] path를
+          # `/v1/models`(바른 접두어 없음)에서 `/omni/v1/models`로 정정.
+          # 이전 주석은 "이 백엔드 포트는 base path 없이 bare로 응답한다"고
+          # 적어 뒀지만, 실측(`kubectl exec`로 컨테이너 안에서 직접 fetch)
+          # 결과 `/v1/models`는 404, `/omni/v1/models`만 200이었다 —
+          # docker-compose.yml의 healthcheck가 애초에 `/omni/v1/models`를
+          # 썼던 것이 맞았다(이 chart를 옮겨 적을 때 접두어가 누락된 것이
+          # 진짜 원인). 이 오타 때문에 startupProbe가 절대 통과하지 못해
+          # `Killing: failed startup probe`로 무한 재시작하고 있었다(실측
+          # 이벤트: "Startup probe failed: HTTP probe failed with
+          # statuscode: 404").
+          #
+          # ★ [2026-07-28 실배포 실측 — 결함 5] timeoutSeconds 명시(1→5).
+          #
+          # 실측 이벤트:
+          #   Liveness probe failed: ... read: connection reset by peer
+          #   Readiness probe failed: ... EOF
+          # 이전에는 timeoutSeconds를 명시하지 않아 k8s 기본값(1초)이
+          # 적용됐다. Next.js(임베디드 WS 데몬·배치 프로세서 등 다수의
+          # 백그라운드 초기화가 STARTUP 로그에 보이듯 기동 중 순간적으로
+          # 바쁘다) 기동 구간에는 소켓이 열렸다 닫히는 과도기가 있고, 1초는
+          # 그 과도기를 실패로 잡기에 너무 공격적이다. timeoutSeconds: 5로
+          # 여유를 준다.
+          #
+          # ★ [2026-07-28 실배포 실측 — 결함 3] startupProbe 신설(같은
+          # compose-healthcheck-vs-k8s-liveness 차이, 다른 컴포넌트와 동일
+          # 근거). compose 예산(start_period:15s, interval:10s, retries:5 →
+          # 15+50=65초)에 여유를 더해 failureThreshold 12 × periodSeconds 10
+          # = 120초 — Next.js 콜드 스타트 + better-sqlite3 초기화를 감안.
+          startupProbe:
+            httpGet:
+              path: /omni/v1/models
+              port: 20128
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /omni/v1/models
+              port: 20128
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /omni/v1/models
+              port: 20128
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: {{ .Values.resources.omniroute.cpu | quote }}
+              memory: {{ .Values.resources.omniroute.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.omniroute.cpu | quote }}
+              memory: {{ .Values.resources.omniroute.memory | quote }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/component: omniroute
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.omniroute.storageClassName }}
+        storageClassName: {{ .Values.storage.omniroute.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.omniroute.size }}
+{{- end }}

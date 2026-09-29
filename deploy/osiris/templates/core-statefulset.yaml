@@ -1,0 +1,172 @@
+# osiris-core — Neo4j에 대한 유일한 쓰기 관문(A5/G7/D17), §2 배치도.
+#
+# (a) nodeAffinity(K4): 코어의 상태 소유권(Neo4j가 유일한 진실)은 노드
+#     분산이 아니라 노드 고정으로 지켜야 정합이 단순해진다(§0 K4 근거).
+#     대가: osiris.dev/role=main 노드가 죽으면 osiris-core가 죽고
+#     재스케줄되지 않는다 — §2가 "사고가 아니라 명시적으로 수용한 설계"
+#     라고 못박은 그대로다. 이 chart는 그 대가를 숨기지 않는다.
+# (b) Guaranteed QoS(requests==limits) + priorityClassName: K4의 대가를
+#     값으로도 갚는다 — 단일 노드에서는 taint/toleration이 자원을 예약
+#     하지 않는다는 것이 이 설계의 실측 사실이다(§0 K4 옆 칸, 작업 지시
+#     §2). osiris-core-critical(templates/priorityclass.yaml)과 함께
+#     자원 압박 상황에서 스스로를 지킨다.
+# (c) Service 이름 고정("osiris-core"): 에이전트가 아는 세 호스트명 중
+#     하나(10-core-architecture.md §1.2 불변자산 10번) — release-prefix
+#     관례를 따르면 이 불변식이 깨진다(_helpers.tpl 상단 주석 참고).
+apiVersion: v1
+kind: Service
+metadata:
+  # ★ [2026-07-28 실배포 실측 — 결함 2] 클라이언트용 ClusterIP Service.
+  #
+  # 이전에는 "헤드리스 — StatefulSet 관례"라는 이유만으로 clusterIP: None
+  # 을 줬는데, 이 이름("osiris-core")은 §1.2 불변자산 10번이 고정한 세
+  # 호스트명 중 하나라 절대 안 풀리는 순간이 있으면 안 된다. 실측:
+  # osiris-api/osiris-orchestrator가 이 Service를 CORE_BASE_URL로 참조
+  # 하는데, headless일 때는 osiris-core-0이 Ready가 되기 전까지 이름
+  # 자체가 없어(NXDOMAIN과 동일한 성질의 문제) 재시도 루프가 깨진다.
+  # StatefulSet 관례(안정 파드 DNS)는 아래 별도 governing headless
+  # Service로 충족한다 — "안정 네트워크 ID"와 "클라이언트가 항상 풀리는
+  # 이름으로 붙는 것"은 다른 요구이고, 후자가 §1.2 불변자산이다.
+  name: {{ include "osiris.coreServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: core
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: core
+  ports:
+    - name: health
+      port: 8081
+      targetPort: 8081
+    - name: api
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # governing headless Service — StatefulSet.spec.serviceName 전용.
+  # neo4j-statefulset.yaml의 동일 패턴 참고.
+  name: {{ include "osiris.coreHeadlessServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: core
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: core
+  ports:
+    - name: health
+      port: 8081
+      targetPort: 8081
+    - name: api
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: osiris-core
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: core
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "osiris.coreHeadlessServiceName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: core
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: core
+    spec:
+      # SA/RBAC/TokenReview 권한(K7, §7.1) — templates/rbac-core.yaml이
+      # 이 ServiceAccount를 만들고 tokenreviews.authentication.k8s.io의
+      # create 권한만 준다(그 파일의 주석이 §7.1을 그대로 옮겨 "워크로드
+      # 생성 권한이 아니다"를 명문화한다).
+      serviceAccountName: osiris-core
+      priorityClassName: osiris-core-critical
+      {{- include "osiris.mainNodeAffinity" . | nindent 6 }}
+      containers:
+        - name: osiris-core
+          image: "{{ .Values.images.core.repository }}:{{ .Values.images.core.tag }}"
+          imagePullPolicy: {{ .Values.images.core.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: 8081
+            - name: api
+              containerPort: 8090
+          env:
+            - name: NEO4J_URI
+              value: "bolt://{{ include "osiris.neo4jServiceName" . }}:7687"
+            - name: NEO4J_USER
+              value: "neo4j"
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NEO4J_PASSWORD
+            - name: NATS_CORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_CORE_PASSWORD
+            # "dependent environment variables" — $(VAR) 치환은 K8s가 같은
+            # 컨테이너의 앞서 정의된 env 이름을 문자열 안에 끼워 넣도록
+            # 네이티브로 지원한다. nats.go의 Connect(url)이 URL의 userinfo
+            # 로 인증하므로(orchestrator/internal/config의 NatsURL 주석과
+            # 같은 패턴), 시크릿 값을 URL 문자열에 합성해야 하는데, 별도
+            # entrypoint 스크립트 없이 이 네이티브 치환으로 충분하다.
+            - name: NATS_URL
+              value: "nats://osiris-core:$(NATS_CORE_PASSWORD)@{{ include "osiris.natsServiceName" . }}:4222"
+            - name: HEALTH_ADDR
+              value: ":8081"
+            - name: API_ADDR
+              value: ":8090"
+            - name: CATALOG_VERSION
+              value: {{ .Values.catalogVersion | quote }}
+            - name: CORE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: CORE_API_TOKEN
+            - name: ORG_NAME
+              value: {{ .Values.orgName | quote }}
+          # core/internal/api/health.go: /livez는 항상 가벼운 무조건 200,
+          # /readyz는 neo4j+nats+catalogSeed를 전부 확인한다 — 그래서 여기도
+          # liveness는 /livez, readiness는 /readyz로 나눈다.
+          #
+          # ★ [2026-07-28 실배포 실측 — 결함 3] startupProbe 신설 — 다른
+          # 코어 컴포넌트(neo4j/nats)와 동일한 이유(compose healthcheck는
+          # 안 죽이지만 k8s liveness는 죽인다). /livez 자체는 가벼워 금방
+          # 200을 주지만, 프로세스가 뜨기 전(이미지 pull/초기화) 구간을
+          # startupProbe로 gate해 둔다 — compose 예산(start_period:15s,
+          # interval:10s, retries:3 → 15+30=45초)에 여유를 더해 60초.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: 8081
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8081
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.resources.core.cpu | quote }}
+              memory: {{ .Values.resources.core.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.core.cpu | quote }}
+              memory: {{ .Values.resources.core.memory | quote }}

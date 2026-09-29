@@ -1,0 +1,352 @@
+# OSiris Helm chart 기본값.
+#
+# 여기 있는 값만 실제로 조정 대상이다(작업 지시 §5 "쓰지 않는 값을 넣지
+# 않는다") — 이미지 태그, 리소스, 스토리지 크기, 노드 라벨, 시크릿 참조.
+# env var *이름*이나 포트 번호처럼 이미 코드가 고정한 것(core/orchestrator/
+# api의 internal/config/config.go, docker-compose.yml)은 여기서 값으로
+# 노출하지 않는다 — 각 템플릿에 리터럴로 박아 둔다. 그것들은 "조정 대상"이
+# 아니라 "이미 정해진 계약"이기 때문이다.
+
+global:
+  # K4 — 코어 노드 고정에 쓰는 라벨. 설치자가 실제 메인 노드에
+  #   kubectl label node <노드-이름> osiris.dev/role=main
+  # 로 미리 부여해야 한다(§2 배치도, §9 토폴로지의 "nodeAffinity:
+  # osiris.dev/role=main"). 이 chart는 라벨을 스스로 붙이지 않는다 —
+  # "어느 노드가 메인인가"는 설치자의 판단이지 chart가 추측할 일이 아니다.
+  nodeAffinityKey: osiris.dev/role
+  nodeAffinityValue: main
+  # ★ [2026-07-28 실배포 실측 — 결함 1] 기본값 false.
+  #
+  # true로 두면 core/neo4j/nats StatefulSet에 required nodeAffinity가
+  # 렌더된다(_helpers.tpl의 osiris.mainNodeAffinity). 실측: 이 값이
+  # 항상 켜져 있으면, 위 라벨을 아무도 붙이지 않은 클러스터(단일 노드
+  # dev 클러스터 포함)에 기본 설치를 하는 것만으로 neo4j-0/nats-0/
+  # osiris-core-0가 전부 `FailedScheduling`으로 Pending에 멈춘다 — 노드는
+  # chart가 라벨을 붙일 수 있는 대상이 아니기 때문이다.
+  #
+  # 그래서 기본은 false(affinity 렌더 안 함 — 단일 노드에는 어차피
+  # 불필요, 스케줄러가 갈 곳이 하나뿐이다). **멀티노드로 전환할 때만**
+  # true로 켜라 — 그 전에 반드시:
+  #   kubectl label node <메인-노드> osiris.dev/role=main
+  # 를 먼저 해야 한다(README.md "멀티노드 전환" 절). K4의 대가(메인
+  # 노드를 잃으면 core/neo4j/nats가 재스케줄되지 않고 컨트롤 플레인과
+  # 함께 죽는다)는 이 스위치를 켜는 순간부터 그대로 유효하다 — 감추지
+  # 않는다.
+  pinCoreToMainNode: false
+
+images:
+  core:
+    repository: osiris/core
+    tag: dev
+    pullPolicy: IfNotPresent
+  api:
+    repository: osiris/api
+    tag: dev
+    pullPolicy: IfNotPresent
+  orchestrator:
+    repository: osiris/orchestrator
+    tag: dev
+    pullPolicy: IfNotPresent
+  omniroute:
+    repository: osiris/omniroute-omni
+    tag: dev
+    pullPolicy: IfNotPresent
+  egress:
+    repository: ubuntu/squid
+    tag: 6.6-24.04_edge
+    pullPolicy: IfNotPresent
+  neo4j:
+    repository: neo4j
+    tag: 5.24-community
+    pullPolicy: IfNotPresent
+  nats:
+    repository: nats
+    tag: 2.10-alpine
+    pullPolicy: IfNotPresent
+  console:
+    # `[2026-07-28 Phase C-2b]` 결함 1 해소: console/Dockerfile이 이제
+    # 실제로 존재한다(멀티스테이지 — node로 SPA 빌드 후
+    # nginxinc/nginx-unprivileged에 산출물만 COPY, 라우팅 conf는 굽지
+    # 않는다 — 라우팅은 K3에 따라 Ingress가 맡는다). 이미지 이름 자체는
+    # 이전 phase가 이미 이 값으로 자리를 잡아 두었으므로 바꾸지 않았다.
+    repository: osiris/console
+    tag: dev
+    pullPolicy: IfNotPresent
+
+# Guaranteed QoS(requests==limits)를 코어 3종(core/neo4j/nats)에 강제한다
+# 이유는 각 템플릿 상단 주석 참고 — K4가 코어를 노드에 고정하는 대가로
+# "단일 노드에서는 taint/toleration이 자원을 예약하지 않는다"는 사실이
+# 실측되어 있어(§0 K4 옆 칸), 이 세 워크로드만은 별도로 스스로를 지켜야
+# 한다. api/orchestrator/omniroute/egress/console은 이 요구가 없다 — 코어
+# 3종만큼 노드 고정의 대가를 지지 않기 때문이다(스케줄러가 자유 배치).
+resources:
+  core:
+    cpu: "1"
+    memory: 1Gi
+  # ★ [2026-07-28 실배포 실측 — 결함 3 조사 중 발견] 1500Mi에서 2Gi로 상향.
+  #
+  # 실측: neo4j-0이 매번 자기 자신을 shutdown하고 있었다(프로브가 죽인 게
+  # 아니라 neo4j 자신의 기동 검증이 거부한 것):
+  #   ERROR Invalid memory configuration - exceeds physical memory. Check
+  #   the configured values for server.memory.pagecache.size and
+  #   server.memory.heap.max_size
+  # 원인은 산수다 — neo4j-statefulset.yaml이 주는
+  #   NEO4J_server_memory_pagecache_size=512m + heap_max=1G(=1024m)
+  #   = 1536Mi(논리 합)
+  # 인데 컨테이너 메모리 한도가 그보다 **작은** 1500Mi였다(요청한 페이지
+  # 캐시+힙 합이 컨테이너 자신에게 준 한도를 초과 — neo4j가 cgroup
+  # 한도를 보고 스스로 거부한다). 게다가 pagecache+heap 합만으로도
+  # 빠듯하면 JVM 메타스페이스·스레드 스택·GC 오버헤드가 들어갈 자리가
+  # 없다. 2Gi는 1536Mi 논리 합 위에 충분한 여유(약 33%)를 더한 값이다.
+  neo4j:
+    cpu: "1"
+    memory: 2Gi
+  nats:
+    cpu: "500m"
+    memory: 512Mi
+  api:
+    cpu: "250m"
+    memory: 256Mi
+  orchestrator:
+    cpu: "250m"
+    memory: 256Mi
+  # ★ [2026-07-28 실배포 실측 — 결함 4] 512Mi에서 1536Mi로 상향.
+  #
+  # 실측: osiris-omniroute-0가 OOMKilled로 반복 재시작했다
+  #   lastState.terminated: {"exitCode":0,"reason":"OOMKilled"}, restarts=6
+  #
+  # 근거: docker-compose.yml의 osiris-omniroute 서비스에는 mem_limit/
+  # deploy.resources 상한이 **아예 없다**(확인함 — grep 결과 없음) — 즉
+  # compose는 이 워크로드의 실제 메모리 요구치에 대해 아무 힌트도 주지
+  # 않는다. 대신 이미지 자체의 예산을 봐야 한다:
+  # `omniroute-build/Dockerfile`의 러너 스테이지가
+  #   ENV OMNIROUTE_MEMORY_MB=1024
+  #   ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
+  # 로 V8 old-space 힙 상한을 **1024MB**로 이미 못박아 둔다(실측 확인).
+  # `--max-old-space-size`는 V8 old-space만 제한할 뿐 RSS 전체(Node
+  # 자신의 오버헤드, native addon인 better-sqlite3의 off-heap 버퍼,
+  # young generation, 프로세스 상주 메모리)는 포함하지 않는다 — 그래서
+  # 컨테이너 메모리 한도가 이 1024MB보다 낮으면(이전 512Mi) 힙이
+  # 그 한도에 닿기도 전에 무조건 OOM이다. 1536Mi(1.5GB)는 1024MB 힙
+  # 상한에 약 50% 여유를 더해 non-heap 오버헤드를 흡수하는 값이다.
+  omniroute:
+    cpu: "500m"
+    memory: 1536Mi
+  egress:
+    cpu: "250m"
+    memory: 256Mi
+  console:
+    cpu: "100m"
+    memory: 128Mi
+
+storage:
+  neo4j:
+    size: 20Gi
+    storageClassName: ""
+  nats:
+    size: 5Gi
+    storageClassName: ""
+  omniroute:
+    size: 5Gi
+    storageClassName: ""
+  # osiris-api의 masterkey 파일 상태(§4.4/§6.2 — 이 phase는 Go 코드를 바꾸지
+  # 않으므로 K8s Secret이 아니라 여전히 파일시스템으로 유지된다. 각
+  # api-deployment.yaml의 TODO 참고).
+  apiState:
+    size: 100Mi
+    storageClassName: ""
+  # `[2026-07-28 Phase C-3c]` 온보딩 0단계의 .env 쓰기 경로(applyGatewayTokenToEnv/
+  # applyManageKeyToEnv, omniroute/operations.mjs)를 위한 PVC. api-deployment.yaml
+  # 의 repo-env 볼륨/initContainer 주석 참고 — Secret(읽기 전용)에서 PVC(쓰기
+  # 가능)로 바꿔 0단계가 실제로 파일에 쓸 수 있게 한다.
+  repoEnv:
+    size: 100Mi
+    storageClassName: ""
+
+replicaCount:
+  api: 1
+  orchestrator: 1
+  console: 1
+
+# docs/design/90-infra-topology.md §4.3(2)(b) — osiris-api의 워크로드 read
+# Role(rbac-api.yaml)을 바인딩할 `infra-*` 네임스페이스 목록. 비어 있는
+# 것이 정직한 기본값이다: 이 클러스터에는 아직 infra-* 네임스페이스가
+# 하나도 없다(§8 blocker 3/4 — IN13 ResourceQuota+PriorityClass, IN14
+# default-deny NetworkPolicy가 그 첫 네임스페이스 프로비저닝 전에 먼저
+# 확정되어야 한다). 이름을 여기 추가하는 것은 그 네임스페이스에 osiris-api
+# 읽기 전용 Role을 바인딩하는 것뿐 — infra-operator 쓰기 권한이나
+# ResourceQuota/NetworkPolicy 자체를 만들지 않는다(그건 별도 템플릿의 몫).
+infraNamespaces: []
+
+# --- omniroute 모드 — embedded(기본) | external -------------------------------
+# embedded: osiris-omniroute StatefulSet(소스 빌드 이미지, /omni basePath)을 띄운다.
+# external: 이미 운용 중인 omniroute에 붙는다 — StatefulSet·headless Service를
+#   만들지 않고(설치 skip), `osiris-omniroute` Service를 selector 없는 Service +
+#   Endpoints(external.ip:port)로 만든다. 이름이 그대로라 squid 허용목록
+#   (allow_osiris_omniroute)·클라이언트 설정은 바뀌지 않는다. 차이:
+#   - 외부는 루트 경로로 서빙 → api의 base URL에서 `/omni`가 빠지고 헬스는 /healthz
+#   - api의 manage 키는 OSIRIS_OMNIROUTE_ROOT_KEY 대신 secrets.omnirouteManageKey
+#     (외부 인스턴스가 발급한 manage 스코프 키), secrets.gatewayToken도 외부 발급값
+#   - NetworkPolicy는 파드 셀렉터 대신 external.ip/32:port로 api·orchestrator·egress
+#     egress를 연다
+#   - /omni 인그레스는 외부 인스턴스 루트와 경로가 안 맞으므로 외부 UI는 그
+#     인스턴스 자신의 주소로 접속한다
+#   external.ip: 클러스터 노드에서 닿는 주소. 이 호스트(k3d)는 k3d 망 고정 IP의
+#   브리지 컨테이너(socat → docker `omniroute`)를 쓴다 — bin/omni-external-bridge.sh.
+omniroute:
+  mode: embedded
+  external:
+    ip: ""
+    port: 20128
+    # 콘솔 "omniroute 원본 콘솔"이 여는 외부 인스턴스 관리 UI 주소(브라우저 기준).
+    # iframe 임베드하려면 그 인스턴스가 콘솔 오리진의 frame-ancestors를 허용해야 한다
+    # (예: 상위 리버스 프록시에서 CSP frame-ancestors에 콘솔 오리진을 넣는다).
+    uiUrl: ""
+
+# --- G5 — 자격증명은 secretKeyRef로 (평문 하드코딩 금지) --------------------
+# 아래 값 자체를 이 파일(버전관리 대상)에 채우지 않는다. 운영자가
+#   helm install osiris ./deploy/osiris -f values-secret.yaml
+# 처럼 별도(.gitignore된) 파일이나 --set-string으로 채우거나,
+# existingSecretName으로 이미 클러스터에 있는 Secret을 가리킨다.
+secrets:
+  existingSecretName: ""
+  neo4jPassword: ""
+  coreApiToken: ""
+  natsCorePassword: ""
+  natsOrchestratorPassword: ""
+  natsApiPassword: ""
+  # 비워 두는 것이 기본값이자 권장값 — .env.example의 동일 규율
+  # (OSIRIS_OMNIROUTE_ADMIN_PASSWORD: "온보딩 소관, 사람이 대면하는
+  # 자격증명이라 설치 시점에 미리 발명하지 않는다").
+  omnirouteAdminPassword: ""
+  # [2026-09-11] omniroute **루트 키**(사용자 확정, 설계 근거는
+  # secrets.yaml의 OSIRIS_OMNIROUTE_ROOT_KEY 주석). 설치 시점에 osiris-up이
+  # 랜덤 생성해 채운다 — 사람이 정하는 값이 아니다.
+  omnirouteRootKey: ""
+  # [폐기됨] 온보딩이 런타임에 발급받아 되쓰던 manage 키. 루트 키가 그
+  # 역할을 대신하므로 더 이상 쓰이지 않는다 — secrets.yaml 참고.
+  omnirouteManageKey: ""
+  # osiris-orchestrator가 §8.5 genesis 절차에서 core에 거는 정적 토큰과
+  # 같은 값(CORE_API_TOKEN 재사용, HI11 — 새 변수가 아니다).
+  gatewayToken: ""
+
+# --- osiris-agents 네임스페이스 자원 상한 (C-1이 넘긴 몫, C-3a가 갚음) ---
+# templates/resourcequota-agents.yaml 상단 주석 참고 — 단일 노드에서
+# taint가 자원을 예약하지 않는 실측 결과(§0 K4) 때문에, 이 값들이 코어
+# 보호의 실질 수단이다. perAgentMaxCpu/Memory·per-agent storage 값은
+# RoleResourceProfile이 개별 에이전트에 줄 수 있는 상한의 여유값이지,
+# 특정 역할 프로필 값을 그대로 베낀 것이 아니다(하드코딩된 팀 예산이
+# 아니라 "이 이상은 명백히 비정상"이라는 안전판).
+resourcequota:
+  agents:
+    # 네임스페이스 총량 — maxResidentAgents(4, 위 값)를 기준으로 여유를
+    # 둔 값이다. 에이전트 1명의 기본 리소스 프로필(20-ontology-schema.md
+    # §3.7의 RoleResourceProfile 기본값 범위)이 CPU 1~2 vCPU/메모리
+    # 1~2Gi 사이로 잡히는 것을 가정해 4명 상주 + 여유를 반영했다.
+    requestsCpu: "8"
+    requestsMemory: 16Gi
+    limitsCpu: "8"
+    limitsMemory: 16Gi
+    requestsStorage: 100Gi
+    pods: "16"
+    persistentVolumeClaims: "16"
+    # LimitRange의 Container/PVC 상한 — 에이전트 1개가 네임스페이스
+    # 총량을 혼자 다 써버리는 것을 막는 개별 상한(총량과 별개 축).
+    perAgentMaxCpu: "4"
+    perAgentMaxMemory: 4Gi
+    perAgentMinStorage: 1Gi
+    perAgentMaxStorage: 20Gi
+  # [2026-09-11] 90-infra-topology.md IN13 — 각 infra-* 네임스페이스에 걸리는
+  # ResourceQuota 총량. templates/infra-namespaces.yaml이 infraNamespaces의
+  # **네임스페이스마다** 이 값을 적용한다(네임스페이스별 총량 — agents처럼
+  # 하나의 큰 예산이 아니라 서비스 스택 하나가 쓸 만한 보수적 상한). 무거운
+  # 상태형 스택을 올릴 땐 그 네임스페이스만 별도 상향하는 것이 이관 판단의
+  # 일부다. 단일 8코어 노드에서 AI-org(코어 ~3.4 + agents 예약 8)와 공존해야
+  # 하므로 인프라 네임스페이스 하나가 노드를 삼키지 못하게 낮게 잡는다.
+  infra:
+    requestsCpu: "2"
+    requestsMemory: 2Gi
+    limitsCpu: "4"
+    limitsMemory: 4Gi
+    pods: "20"
+
+publicOrigin: "http://localhost:18280"
+orgName: "OSiris"
+catalogVersion: "2026.08.1"
+maxResidentAgents: 4
+
+# --- Ingress (K3, 70 §3.3/§8) ---------------------------------------------
+# 컨트롤러 종류는 70 §8이 아직 "미결"로 남긴 항목이다 — SSE annotation
+# 문법이 컨트롤러마다 달라(§3.3) 이 값으로 분기한다(templates/ingress.yaml).
+# 지금은 nginx(ingress-nginx) 분기만 실제로 채워져 있고, traefik 분기는
+# TODO 주석만 있다(작업 지시 범위 그대로).
+ingress:
+  enabled: true
+  # nginx | traefik — 다른 값은 templates/ingress.yaml이 렌더를 실패시킨다
+  # (조용히 잘못된 annotation 없이 배포되는 것을 막기 위해, §8 미결 상태를
+  # 숨기지 않는다).
+  controller: nginx
+
+  # ★ [2026-07-28 실배포 실측] configuration-snippet은 기본 비활성이다.
+  #
+  # ingress-nginx 1.9+ 는 `allow-snippet-annotations`를 기본 false로 두고,
+  # snippet을 쓰는 Ingress를 admission webhook이 거부한다(실측 원문):
+  #   admission webhook "validate.nginx.ingress.kubernetes.io" denied the request:
+  #   nginx.ingress.kubernetes.io/configuration-snippet annotation cannot be used.
+  #   Snippet directives are disabled by the Ingress administrator
+  #
+  # SSE에 **실제로 필요한 것은 전용 annotation으로 전부 표현된다**:
+  #   proxy_buffering off  → nginx.ingress.kubernetes.io/proxy-buffering
+  #   proxy_read_timeout   → .../proxy-read-timeout
+  #   proxy_send_timeout   → .../proxy-send-timeout
+  # snippet이 담고 있던 나머지(`proxy_cache off`, `proxy_http_version 1.1`,
+  # `chunked_transfer_encoding on`)는 ingress-nginx의 **기본값이 이미 그렇다** —
+  # 초판이 "우연에 맡기지 않겠다"며 명시적으로 반복한 것이고, 그 belt-and-braces가
+  # 설치 자체를 막았다.
+  #
+  # 그래서 기본은 false다. 클러스터 관리자가 컨트롤러에
+  # `--enable-snippet-annotations=true`(또는 configmap `allow-snippet-annotations`)를
+  # 켠 배포에서만 true로 올리면 §108.1이 실측한 지시어를 문자 그대로 재현한다.
+  #
+  # ★ 이 값을 false로 두는 대가: SSE 동작이 "전용 annotation 3개 + 컨트롤러
+  # 기본값"에 의존한다. 그래서 **배포 후 SSE를 실측해야 한다** — §108이 compose에서
+  # 그랬던 것처럼 프레임 도착 시각을 찍어 확인하는 것이 유일한 확증이다.
+  useConfigurationSnippet: false
+
+  # omnirouteCatchAll — compose의 `location /` → `/omni/$1` rewrite catch-all.
+  #
+  # ★ [2026-09-11] 기본 true로 바꿨다. 서브 URL(`/omni`) 배포에서 **이것이 없으면
+  # omniroute 로그인이 동작하지 않는다** — 브라우저가 `POST /api/auth/login`처럼
+  # 루트 절대경로로 보내는데(리터럴 `"/api/`를 쓰는 소스 파일 298개, Next basePath는
+  # 리터럴 문자열에 붙지 않는다) 받아줄 규칙이 없어 콘솔로 떨어진다.
+  #
+  # 구 주석의 "켜면 콘솔의 `/`와 충돌한다"는 콘솔 `/`가 `pathType: Prefix`였을 때의
+  # 이야기다. `Exact`(= `location = /`, 정규식보다 무조건 우선)로 바뀐 지금은 충돌
+  # 하지 않는다. 함께 필요한 전제와 생성되는 location 순서는 templates/ingress.yaml의
+  # catch-all 블록 주석에 전부 적어 뒀다 — 이 값을 false로 되돌리기 전에 읽을 것.
+  omnirouteCatchAll: true
+
+  # controllerNamespace — Ingress 컨트롤러가 사는 네임스페이스. NetworkPolicy가
+  # 이 네임스페이스에서 오는 트래픽만 omniroute/console에 허용한다.
+  controllerNamespace: ingress-nginx
+  # 온보딩이 결정할 배포 시점 정보(§2.9 단일 공개 도메인 원칙, gw/conf.d/
+  # default.conf가 이미 server_name을 고정하지 않는 것과 같은 이유) — 이
+  # chart도 발명하지 않는다. 비워 두면 host 없는 Ingress rule(모든 Host
+  # 허용)로 렌더링된다.
+  host: ""
+  tlsSecretName: ""
+  # ★ [2026-07-28 실배포 실측] 기본값이 "nginx"여야 한다.
+  #
+  # 빈 값이면 템플릿이 `ingressClassName`을 아예 렌더하지 않고, ingress-nginx는
+  # 클래스 없는 Ingress를 **조용히 무시**한다(실측 로그 원문):
+  #   Ignoring ingress osiris-system/osiris-console
+  #   error="ingress does not contain a valid IngressClass"
+  # 그 결과 Ingress 4개가 전부 무시되어 모든 경로가 404가 됐다 — 파드는 7개
+  # 전부 Running인데 화면이 안 뜨는 상태였고, `helm lint`/`template`으로는
+  # 잡히지 않는다(문법은 완전히 유효하다).
+  #
+  # 이 차트는 `ingress.controller`가 nginx가 아니면 `fail`로 설치를 막는다.
+  # 즉 컨트롤러는 이미 nginx로 고정되어 있으므로 클래스 기본값도 "nginx"인
+  # 것이 일관된다. 다른 클래스명을 쓰는 배포(예: `nginx-internal`)는 이 값을
+  # 덮어쓰면 된다.
+  className: "nginx"

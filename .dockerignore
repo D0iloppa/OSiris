@@ -1,0 +1,12 @@
+# Root .dockerignore — every osiris-* image builds with `context: .` (repo
+# root), because at least one Dockerfile (api/Dockerfile, gw/Dockerfile)
+# needs to COPY a file from outside its own subdirectory (omniroute/,
+# console/). Without this file, `docker build`/`docker compose build` tars
+# up console/node_modules (hundreds of MB, never referenced by any
+# Dockerfile COPY) on every build — added while wiring gw/Dockerfile
+# (console SPA baked into the osiris-gw image) after noticing the build
+# context transfer step was the slowest part of an otherwise-fast build.
+console/node_modules
+console/dist
+**/node_modules
+.git

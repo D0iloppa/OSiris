@@ -1,0 +1,63 @@
+# osiris-agents 네임스페이스 자원 상한 — Phase C-1이 다음 phase로 넘긴
+# 항목(priorityclass.yaml 하단 주석 "ResourceQuota/LimitRange … 이번
+# phase 범위가 아니다(C-2/C-3의 몫)"). 이 phase(C-3a)가 그 몫을 갚는다.
+#
+# ★ 왜 이것이 "실질 코어 보호 수단"인가: Phase B 실측(70 §0 K4 옆 칸,
+# priorityclass.yaml 상단 주석)이 이미 확인했듯 **단일 노드에서는 taint가
+# 자원을 예약하지 않는다** — nodeAffinity로 osiris-core/neo4j/nats를
+# osiris.dev/role=main에 고정해도, 그 노드에 다른 워크로드가 몰리면 자원
+# 압박이 그대로 전이된다. PriorityClass(이미 만들어짐)는 압박이 "이미
+# 벌어진 뒤" evict 순서를 정할 뿐이다 — ResourceQuota/LimitRange는 그
+# 압박 자체가 osiris-agents 네임스페이스 밖으로(정확히는, 그 네임스페이스
+# 총량을 넘어서는 방향으로) 자라나지 못하게 **사전에** 막는 유일한 수단
+# 이다. 조인 노드가 아직 없는 단일 노드 구성에서는 이것이 코어 보호의
+# 사실상 전부다.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: osiris-agents-quota
+  namespace: {{ include "osiris.agentsNamespace" . }}
+  labels:
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  hard:
+    requests.cpu: {{ .Values.resourcequota.agents.requestsCpu | quote }}
+    requests.memory: {{ .Values.resourcequota.agents.requestsMemory | quote }}
+    limits.cpu: {{ .Values.resourcequota.agents.limitsCpu | quote }}
+    limits.memory: {{ .Values.resourcequota.agents.limitsMemory | quote }}
+    requests.storage: {{ .Values.resourcequota.agents.requestsStorage | quote }}
+    pods: {{ .Values.resourcequota.agents.pods | quote }}
+    persistentvolumeclaims: {{ .Values.resourcequota.agents.persistentVolumeClaims | quote }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: osiris-agents-limits
+  namespace: {{ include "osiris.agentsNamespace" . }}
+  labels:
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      # 10-core-architecture.md §5.4: "CPU limit은 >= 1000m(1 vCPU)을
+      # 강제한다(orchestrator가 검증). 헬스 goroutine이 굶지 않도록." —
+      # 원래는 orchestrator 자신의 애플리케이션 레벨 검증이었던 이 하한을
+      # 여기서 네임스페이스 전역 LimitRange의 min으로 한 번 더 강제한다
+      # (crds/agent.yaml의 spec.resources.cpuMilli도 같은 값을 CR
+      # 스키마 레벨에서 이중으로 강제 — 세 계층 모두가 같은 숫자를
+      # 지킨다: CRD 스키마 / orchestrator 검증 / 네임스페이스 LimitRange).
+      # 이 하한이 있는 이유는 CPU가 0에 가깝게 throttle되면 supervisor의
+      # 헬스 goroutine(§5.4 /livez가 요구하는 5초 티커)이 스케줄러에게
+      # 밀려 lastLoopTick이 30초를 넘기고, 그러면 실제로는 살아있는
+      # 프로세스가 죽은 것으로 오판되어 불필요하게 재시작되기 때문이다 —
+      # "굶지 않도록"이 문자 그대로의 근거다.
+      min:
+        cpu: "1000m"
+      max:
+        cpu: {{ .Values.resourcequota.agents.perAgentMaxCpu | quote }}
+        memory: {{ .Values.resourcequota.agents.perAgentMaxMemory | quote }}
+    - type: PersistentVolumeClaim
+      min:
+        storage: {{ .Values.resourcequota.agents.perAgentMinStorage | quote }}
+      max:
+        storage: {{ .Values.resourcequota.agents.perAgentMaxStorage | quote }}

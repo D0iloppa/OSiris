@@ -1,0 +1,210 @@
+# neo4j — 온톨로지(:D1 조직 의도)의 유일한 진실(§2 배치도). 에이전트는
+# 도달 불가(NetworkPolicy는 C-2 몫이지만, §2 배치도 자체가 이미 neo4j를
+# osiris-agents 네임스페이스 밖에 둔다).
+#
+# (a) nodeAffinity(K4): core-statefulset.yaml 상단 주석과 같은 근거 —
+#     Neo4j 자신이 상태 소유자이므로 특히 이 파드의 고정이 K4의 핵심이다.
+# (b) Guaranteed QoS + priorityClassName: core-statefulset.yaml과 동일한
+#     이유(K4의 대가를 값으로 갚는다).
+# (c) Service 이름 고정("neo4j"): 이 이름 자체는 §1.2의 "에이전트가 아는
+#     세 호스트명"에는 들지 않지만, osiris-core/osiris-api/
+#     osiris-orchestrator 세 컴포넌트 모두가 NEO4J_URI 기본값으로
+#     bolt://neo4j:7687을 읽는다(각 internal/config/config.go) — 그래서
+#     여기도 release-prefix 없이 고정한다(_helpers.tpl 상단 주석 참고).
+apiVersion: v1
+kind: Service
+metadata:
+  # ★ [2026-07-28 실배포 실측 — 결함 2] 클라이언트용 ClusterIP Service.
+  #
+  # 실측: 이전에는 이 이름 하나가 headless(clusterIP: None)였다. headless
+  # Service의 DNS는 ready 엔드포인트가 있을 때만 이름을 반환한다 —
+  # neo4j-0이 Ready가 되기 전에는 이름 자체가 없다:
+  #   $ nslookup neo4j.osiris-system.svc.cluster.local
+  #   ** server can't find ...: NXDOMAIN
+  # 그 결과 osiris-core/osiris-orchestrator의 재시도 루프("neo4j not ready
+  # yet … retrying in 2s" — TCP 거부를 전제로 짠 문구 그대로)가 실제로는
+  # "server misbehaving"(NXDOMAIN)을 받아 `fatal: context canceled`로
+  # 죽었다(둘 다 실측 로그). osiris-core/osiris-api/osiris-orchestrator
+  # 세 컴포넌트 모두 NEO4J_URI 기본값(bolt://neo4j:7687)으로 이 이름을
+  # 가정하므로, 이 이름은 **항상 풀리는 일반 ClusterIP**여야 한다 — 그래야
+  # neo4j-0이 아직 안 떠도 이름은 풀리고 TCP만 거부되어(재시도 루프가
+  # 기대하는 그대로) 정상 동작한다. StatefulSet이 요구하는 governing
+  # headless Service는 별도로 아래에 둔다(serviceName 참고).
+  name: {{ include "osiris.neo4jServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: neo4j
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: neo4j
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+    - name: http
+      port: 7474
+      targetPort: 7474
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # governing headless Service — StatefulSet.spec.serviceName 전용
+  # (안정적 파드 DNS `neo4j-0.neo4j-headless...`을 위해 k8s가 요구하는
+  # 것). 클라이언트는 절대 이 이름으로 붙지 않는다 — 위 Service("neo4j")
+  # 가 그 몫이다.
+  name: {{ include "osiris.neo4jHeadlessServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: neo4j
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: neo4j
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+    - name: http
+      port: 7474
+      targetPort: 7474
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: neo4j
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: neo4j
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "osiris.neo4jHeadlessServiceName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: neo4j
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: neo4j
+    spec:
+      priorityClassName: osiris-core-critical
+      # ★ [2026-07-28 실배포 실측 — 결함 2 파생] enableServiceLinks: false.
+      #
+      # 실측: 결함 2를 고쳐 이 Service 이름이 "neo4j"인 채로(ClusterIP로
+      # 되살아난 뒤) neo4j-0을 다시 띄우니 새 오류가 나왔다:
+      #   Failed to read config: Unrecognized setting. No declared setting
+      #   with name: PORT.7687.TCP.PORT.
+      # k8s는 기본적으로(enableServiceLinks: true, 기본값) 같은 네임스페이스의
+      # 모든 Service에 대해 Docker-links 스타일 env(`<SVC명 대문자>_PORT_
+      # <포트>_TCP_PORT` 등)를 파드에 주입한다. 이 Service 이름이 정확히
+      # "neo4j"이므로 그 env 이름이 `NEO4J_PORT_7687_TCP_PORT`가 되고,
+      # neo4j 이미지는(위 NEO4J_AUTH 주석과 같은 이유로) `NEO4J_<설정>` 형태의
+      # env를 전부 서버 설정으로 해석해 strict validation이 기동을 거부한다.
+      # 이 컨테이너는 자기 자신에게 필요한 Service 주소를 전혀 env로 받지
+      # 않으므로(NEO4J_URI 같은 게 없다 — 클라이언트만 그걸 읽는다) 이
+      # 자동 주입을 끄는 것이 안전하고, 이 클래스의 충돌(Service 이름과
+      # env-as-config 파싱 이미지의 이름이 겹치는 문제) 자체를 원천 차단한다.
+      enableServiceLinks: false
+      {{- include "osiris.mainNodeAffinity" . | nindent 6 }}
+      containers:
+        - name: neo4j
+          image: "{{ .Values.images.neo4j.repository }}:{{ .Values.images.neo4j.tag }}"
+          imagePullPolicy: {{ .Values.images.neo4j.pullPolicy }}
+          ports:
+            - name: bolt
+              containerPort: 7687
+            - name: http
+              containerPort: 7474
+          env:
+            # ★ [2026-07-28 실배포 실측] NEO4J_PASSWORD를 이 컨테이너에 주지 않는다.
+            #
+            # neo4j 이미지는 `NEO4J_<setting>` 형태의 env를 **서버 설정으로 해석**한다.
+            # 그래서 `NEO4J_PASSWORD`는 "PASSWORD라는 이름의 설정"이 되고 strict
+            # validation이 기동을 거부한다(실측 로그 원문):
+            #   "Failed to read config: Unrecognized setting.
+            #    No declared setting with name: PASSWORD."
+            #
+            # 초판은 `$(NEO4J_PASSWORD)` dependent-env 치환으로 NEO4J_AUTH를
+            # 합성하려 했다. 그 치환이 성립하려면 NEO4J_PASSWORD가 **이 컨테이너의
+            # env에 존재해야** 하는데, 그 존재 자체가 위의 오류다. 즉 "시크릿에 값을
+            # 두 번 넣지 않는다"는 절약이 기동 불가와 교환되고 있었다.
+            #
+            # `NEO4J_PASSWORD`는 osiris-core/osiris-api가 읽는 **클라이언트 쪽**
+            # 변수이고, 서버 쪽 변수는 `NEO4J_AUTH`(`user/password` 한 덩어리)다.
+            # compose는 애초에 서버에 `NEO4J_AUTH` 하나만 줬다. 그래서 Secret이
+            # 완성된 NEO4J_AUTH를 따로 갖는다(secrets.yaml에서 password로부터 생성).
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NEO4J_AUTH
+            - name: NEO4J_server_memory_pagecache_size
+              value: "512m"
+            - name: NEO4J_server_memory_heap_initial__size
+              value: "512m"
+            - name: NEO4J_server_memory_heap_max__size
+              value: "1G"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # ★ [2026-07-28 실배포 실측 — 결함 3] startupProbe 신설.
+          #
+          # 실측: neo4j-0 restarts=3, "Back-off restarting failed container
+          # neo4j" — 이전에는 livenessProbe만 있었고(initialDelaySeconds:30,
+          # periodSeconds:10, failureThreshold 기본값 3) 이는 기동 60초
+          # 시점에 컨테이너를 죽인다. neo4j 5.x는 1 vCPU 환경에서 60초 안에
+          # HTTP 7474를 열지 못한다.
+          #
+          # compose의 healthcheck(start_period:30s, interval:10s, retries:6)
+          # 는 **실패해도 컨테이너를 죽이지 않는다** — docker는 컨테이너를
+          # "unhealthy"로 표시만 하고 계속 살려 둔다. k8s의 livenessProbe는
+          # 실패가 쌓이면 **컨테이너를 실제로 죽이고 재시작시킨다** — 이
+          # 차이가 compose에서는 안 보이던 문제를 k8s에서 드러낸 것이다.
+          # 그 차이에 대응하는 k8s 관용구가 startupProbe다: 이 프로브가
+          # 성공할 때까지는 livenessProbe/readinessProbe가 아예 평가되지
+          # 않는다(기동 중 죽임 방지) — 성공한 뒤에는 정상적으로 넘어가
+          # 엄격한 liveness/readiness가 그 다음부터 적용된다.
+          # periodSeconds 10 × failureThreshold 30 = 300초(5분) — compose
+          # 예산(30+10*6=90초)보다 넉넉히 크게 잡았다(요구사항: "5분 이상").
+          startupProbe:
+            httpGet:
+              path: /
+              port: 7474
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 7474
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7474
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: {{ .Values.resources.neo4j.cpu | quote }}
+              memory: {{ .Values.resources.neo4j.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.neo4j.cpu | quote }}
+              memory: {{ .Values.resources.neo4j.memory | quote }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/component: neo4j
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.neo4j.storageClassName }}
+        storageClassName: {{ .Values.storage.neo4j.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.neo4j.size }}

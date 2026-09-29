@@ -1,0 +1,169 @@
+# osiris-orchestrator — §2 배치도: "Deployment/StatefulSet — Agent
+# operator 겸임(K9)".
+#
+# ★ [Phase D-1] driver/kube + internal/operator가 이제 실제로 배선됐다.
+# WORKLOAD_DRIVER=kube가 아래 env에 있다 — cmd/osiris-orchestrator/main.go
+# 가 이 값을 보고 docker.sock 기반 WorkloadDriver 대신 driver/kube(Agent CR
+# 을 만들고 지우는 쪽)와 internal/operator(그 CR을 실제 Pod/PVC/SA/Secret
+# 로 물성화하는 쪽, client-go dynamic informer + workqueue — 70 §5.1이 말하는
+# controller-runtime이 아니다, internal/operator/operator.go의 패키지
+# 주석에 그 이탈이 기록돼 있다)를 대신 기동한다. DOCKER_SOCKET_PATH/
+# HOST_PROJECT_DIR은 docker 드라이버(compose 경로, WORKLOAD_DRIVER 미설정
+# 시 기본값)를 위한 값으로만 남아 있고, kube 드라이버는 이 둘을 읽지
+# 않는다 — config.Load()의 기존 검증(HostProjectDir 필수)을 건드리지
+# 않기 위해 플레이스홀더로 남겨둔다.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "osiris.orchestratorServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: orchestrator
+  ports:
+    - name: health
+      port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: osiris-orchestrator
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount.orchestrator }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: orchestrator
+    spec:
+      # 에이전트 네트워크(osiris-agents)에 붙지 않는다 — 에이전트가
+      # orchestrator에 도달할 경로 자체가 없다(§2 원본 comment 계승,
+      # NetworkPolicy로 이 경계를 실제 집행하는 것은 C-2 범위).
+      # ServiceAccount: templates/rbac-operator.yaml이 만들고, 그 파일의
+      # osiris-agent-operator Role(osiris-agents 네임스페이스 한정)로만
+      # 워크로드 생성 권한을 준다 — osiris-system에는 워크로드 생성 권한을
+      # 주지 않는다(같은 파일의 bookkeeping Role은 lease/event뿐).
+      serviceAccountName: osiris-orchestrator
+      containers:
+        - name: orchestrator
+          image: "{{ .Values.images.orchestrator.repository }}:{{ .Values.images.orchestrator.tag }}"
+          imagePullPolicy: {{ .Values.images.orchestrator.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: 8081
+          env:
+            - name: NEO4J_URI
+              value: "bolt://{{ include "osiris.neo4jServiceName" . }}:7687"
+            - name: NEO4J_USER
+              value: "neo4j"
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NEO4J_PASSWORD
+            - name: NATS_ORCHESTRATOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_ORCHESTRATOR_PASSWORD
+            - name: NATS_URL
+              value: "nats://osiris-orchestrator:$(NATS_ORCHESTRATOR_PASSWORD)@{{ include "osiris.natsServiceName" . }}:4222"
+            - name: NATS_CORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_CORE_PASSWORD
+            - name: NATS_API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_API_PASSWORD
+                  optional: true
+            - name: NATS_CONTAINER_NAME
+              value: "osiris-nats"
+            - name: NATS_AUTH_CONF_PATH
+              value: /etc/nats-dynamic/authorization.conf
+            # 위 헤더 TODO 참고 — driver/docker(K9 이전)가 요구하는 값이라
+            # k8s에서 실질적 의미가 없다. 플레이스홀더로만 채운다.
+            - name: DOCKER_SOCKET_PATH
+              value: /var/run/docker.sock
+            - name: HOST_PROJECT_DIR
+              value: /nonexistent-pending-driver-kube
+            - name: STATE_DIR
+              value: /state
+            # [Phase D-1] selects driver/kube + internal/operator over the
+            # default docker driver — see this file's header comment.
+            - name: WORKLOAD_DRIVER
+              value: "kube"
+            - name: AGENTS_NAMESPACE
+              value: {{ include "osiris.agentsNamespace" . | quote }}
+            - name: SYSTEM_NAMESPACE
+              value: {{ include "osiris.systemNamespace" . | quote }}
+            - name: CATALOG_VERSION
+              value: {{ .Values.catalogVersion | quote }}
+            - name: OSIRIS_MAX_RESIDENT_AGENTS
+              value: {{ .Values.maxResidentAgents | quote }}
+            - name: CORE_BASE_URL
+              value: "http://{{ include "osiris.coreServiceName" . }}:8090"
+            - name: CORE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: CORE_API_TOKEN
+            - name: OSIRIS_GATEWAY_BASE_URL
+              value: "http://{{ include "osiris.omnirouteServiceName" . }}:20128"
+            - name: OSIRIS_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: OSIRIS_GATEWAY_TOKEN
+                  optional: true
+            - name: OSIRIS_GATEWAY_HEALTH_PATH
+              value: "/healthz"
+            - name: HEALTH_ADDR
+              value: ":8081"
+            - name: RECONCILE_INTERVAL_SECONDS
+              value: "15"
+          # /etc/nats-dynamic RW 마운트(compose)는 operator가 authorization.conf
+          # 를 재기록하는 통로였다 — C-3(operator가 ConfigMap을 patch하는
+          # 방식으로 대체, nats-statefulset.yaml TODO 참고) 전까지는 볼륨을
+          # 만들지 않는다(어차피 이 phase에서 orchestrator가 그 파일을 쓸
+          # 방법이 없다 — Neo4j/NATS_AUTH_CONF_PATH가 가리키는 경로가 없어도
+          # 헬스체크(/livez, /readyz)는 별도 상태만 본다).
+          # ★ [2026-07-28 실배포 실측 — 결함 3] startupProbe 신설 — api-
+          # deployment.yaml과 동일한 근거(compose start_period:15s/
+          # retries:3, docker healthcheck 실패는 안 죽이지만 k8s liveness는
+          # 죽인다). compose 예산(15+30=45초)에 여유를 더해 60초.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: 8081
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8081
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.resources.orchestrator.cpu | quote }}
+              memory: {{ .Values.resources.orchestrator.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.orchestrator.cpu | quote }}
+              memory: {{ .Values.resources.orchestrator.memory | quote }}

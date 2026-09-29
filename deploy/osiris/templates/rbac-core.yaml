@@ -1,0 +1,64 @@
+# RBAC for osiris-core — 딱 하나의 권한만 준다: TokenReview create.
+#
+# ★★★ 70-kubernetes-deployment.md §7.1을 그대로 옮긴다 (오독 방지) ★★★
+#
+# K7로 인해 osiris-core는 tokenreviews.authentication.k8s.io에 대한
+# create 권한을 갖는다. **이것은 인증 검증 권한이지 워크로드 생성 권한이
+# 아니다.** 10-core-architecture.md §1.7의 G8("core는 워크로드를 만들지
+# 못한다", docker.sock은 orchestrator에만)의 k8s 대응은 **core가
+# Pod/Deployment를 만들거나 수정할 수 없다**는 뜻이며, TokenReview 호출은
+# "제출된 토큰이 유효한 K8s 신원인가"를 K8s API 서버에 **묻는** 것일 뿐
+# 그 자체로 아무 리소스도 만들거나 바꾸지 않는다. 이 구분을 명문화하는
+# 이유는, 이후 누군가 RBAC 감사에서 "core가 k8s 권한을 얻었다"를 "core가
+# 워크로드를 만들 수 있게 됐다"로 오독할 가능성이 실재하기 때문이다 —
+# TokenReview 권한과 워크로드 생성 권한은 K8s RBAC 상에서도 완전히 별개의
+# 리소스(`tokenreviews` vs `pods`/`deployments`)이며 하나가 다른 하나를
+# 함의하지 않는다. (70 §7.1, 원문 그대로)
+#
+# ★ ClusterRole이 불가피한 이유: tokenreviews.authentication.k8s.io는
+# **cluster-scoped 리소스**다(네임스페이스에 속하지 않는다 — TokenReview는
+# "이 토큰이 클러스터 전체에서 유효한 신원인가"를 묻는 API이지 특정
+# 네임스페이스의 오브젝트가 아니다). K8s RBAC은 cluster-scoped 리소스에
+# 대한 권한을 Role(네임스페이스 범위)로 표현할 수 없다 — ClusterRole이
+# **유일한** 문법적 선택지다. 이 Role은 osiris-agent-operator(rbac-
+# operator.yaml)처럼 "좁힐 수 있는데 넓게 준 것"이 아니라, "이 권한의
+# 성질 자체가 네임스페이스 개념을 갖지 않아서 ClusterRole일 수밖에 없는"
+# 경우다.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: osiris-core
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: core
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: osiris-core-tokenreview
+  labels:
+    app.kubernetes.io/component: core
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+rules:
+  # 오직 이것 하나뿐. pods/deployments/그 무엇도 여기 없다 — 있다면 그것이
+  # 버그다(위 주석의 오독 방지 취지 그대로).
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: osiris-core-tokenreview
+  labels:
+    app.kubernetes.io/component: core
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: osiris-core
+    namespace: {{ include "osiris.systemNamespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: osiris-core-tokenreview
+  apiGroup: rbac.authorization.k8s.io

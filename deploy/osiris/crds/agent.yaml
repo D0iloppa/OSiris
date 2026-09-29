@@ -1,0 +1,254 @@
+# Agent CRD — K9/K10 (docs/design/70-kubernetes-deployment.md §5).
+#
+# ★ 왜 이 파일이 templates/가 아니라 crds/에 있는가:
+# Helm은 `crds/` 디렉토리를 특별 취급한다 — 여기 있는 매니페스트는
+# templating(값 치환·조건문)을 거치지 않고 `helm install` 최초 1회에
+# **다른 모든 템플릿보다 먼저** apply된다(Helm 공식 문서: "these resources
+# are simply installed... they cannot be templated"). CRD는 templates/의
+# 리소스(Role의 apiGroup 참조, Agent 오브젝트 자체)가 존재를 전제하므로
+# 반드시 먼저 있어야 하고, `helm upgrade`가 CRD를 자동 갱신하지 않는다는
+# 것도 Helm의 명시된 규약이다(스키마를 바꾸려면 별도 `kubectl apply -f`
+# 필요) — 이 chart도 그 규약을 그대로 따른다. templates/에 두고
+# `{{ ... }}`로 감쌀 이유가 없다: group(osiris.dev)·kind(Agent) 모두
+# release 이름과 무관한 고정값이기 때문이다(_helpers.tpl 상단 주석의
+# "고정 이름" 원칙과 같은 이유).
+#
+# 근거 문서: 70 §5.1(K9 — CRD를 도입하는 유일한 이유는 desired state의
+# etcd 영속화, "그 외의 이유로 CRD를 도입하는 것이 아니다"), §5.2(K10 —
+# namespaced일 수밖에 없는 이유: ownerReference가 네임스페이스를 못
+# 넘는다). spec 필드는 orchestrator/internal/workload/spec.go의
+# AgentWorkloadSpec에서 1:1로 파생했다(발명 금지) — 대응표는 이 phase의
+# 작업 보고에 있다.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: agents.osiris.dev
+spec:
+  group: osiris.dev
+  # K10 — namespaced. 이유는 취향이 아니라 K8s 오브젝트 모델의 제약이다:
+  # ownerReference는 네임스페이스를 넘을 수 없으므로, 이 CR이
+  # osiris-agents의 Pod/PVC/SA/Secret/NetworkPolicy를 소유(및 GC)하려면
+  # CR 자신도 osiris-agents에 있어야 한다(70 §5.2).
+  scope: Namespaced
+  names:
+    kind: Agent
+    listKind: AgentList
+    plural: agents
+    singular: agent
+    shortNames:
+      - ag
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        # status 서브리소스 분리 — operator(spec 소유자)와 드라이버/
+        # supervisor(status 소유자)가 서로 다른 RBAC 규칙 아래서도 안전하게
+        # 같은 오브젝트의 다른 절반을 쓸 수 있게 한다(§6.1 INTENT/
+        # MATERIALIZATION vs OBSERVATION 경계의 K8s 표현).
+        status: {}
+      additionalPrinterColumns:
+        - name: Employee
+          type: string
+          jsonPath: .spec.employeeId
+        - name: Team
+          type: string
+          jsonPath: .spec.teamSlug
+        - name: Desired
+          type: string
+          jsonPath: .spec.desiredState
+        - name: Ready
+          type: string
+          jsonPath: '.status.conditions[?(@.type=="Ready")].status'
+        - name: SpecHash
+          type: string
+          jsonPath: .spec.specHash
+          priority: 1
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            Agent — 직원 1명의 파생 워크로드 의도(spec)와 관측 상태
+            (status). spec은 사람이 편집하는 대상이 아니다: projector가
+            60초마다(그리고 org.changed 즉시) 그래프에서 재계산해 덮어쓴다
+            (`10-core-architecture.md` §6.1 드리프트 교정 문단). spec은
+            AgentWorkloadSpec(orchestrator/internal/workload/spec.go)의
+            필드에서 파생되며, 이 스키마는 그 필드를 구조적으로(structural
+            schema) 명시한다 — x-kubernetes-preserve-unknown-fields로
+            검증을 포기하지 않는다.
+          properties:
+            spec:
+              type: object
+              description: >-
+                AgentWorkloadSpec(Go)의 K8s 표현. Credentials 맵은 의도적
+                으로 이 spec에 없다 — 자격증명은 CR이 소유하는 별도 Secret
+                오브젝트로 물성화된다(K5: "직원 1명 = Pod+PVC+SA+Secret+
+                NetworkPolicy"). spec에 자격증명을 넣으면 `kubectl get
+                agent -o yaml`이 평문으로 되찾을 수 있는 값이 되어 K8s
+                Secret이 주는 별도 취급(암호화 at-rest 옵션, RBAC로
+                secrets만 별도 통제 가능)을 무의미하게 만든다.
+              required:
+                - employeeId
+                - teamId
+                - roleId
+                - image
+                - desiredState
+              properties:
+                employeeId:
+                  type: string
+                  description: "Neo4j :AIAgent.id — 이 Agent CR의 신원. 불변."
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "employeeId is immutable"
+                teamId:
+                  type: string
+                teamSlug:
+                  type: string
+                roleId:
+                  type: string
+                isMaster:
+                  type: boolean
+                  default: false
+                isLead:
+                  type: boolean
+                  default: false
+                image:
+                  type: string
+                modelAlias:
+                  type: string
+                  description: '"osiris/worker" 같은 내부 별칭 — 프로바이더 모델 ID가 아니다.'
+                resources:
+                  type: object
+                  description: ":RoleResourceProfile에서 파생(20-ontology-schema.md §3.7)."
+                  required:
+                    - cpuMilli
+                    - memMiB
+                  properties:
+                    cpuMilli:
+                      type: integer
+                      format: int64
+                      # 10-core-architecture.md §5.4: "CPU limit은 >= 1000m
+                      # (1 vCPU)을 강제한다(orchestrator가 검증). 헬스
+                      # goroutine이 굶지 않도록." 이 최소값의 namespace
+                      # 전역 집행은 templates/resourcequota-agents.yaml의
+                      # LimitRange가 맡는다 — 여기서는 CR 자체의 구조적
+                      # 하한으로 한 번 더 명시한다(이중 방어).
+                      minimum: 1000
+                    memMiB:
+                      type: integer
+                      format: int64
+                      minimum: 1
+                    storageGiB:
+                      type: integer
+                      format: int64
+                      minimum: 0
+                grants:
+                  type: array
+                  description: >-
+                    effective permission codes — §7.1 effective(party)로
+                    이미 resolve되어 정렬·중복제거된 상태(workload.
+                    SortedGrants). CR 자체는 이 목록을 재계산하지 않는다.
+                  items:
+                    type: string
+                networkName:
+                  type: string
+                  description: "osiris-agents NetworkPolicy/네트워크 식별자 — SpecHash의 한 축(§6.2)."
+                concurrency:
+                  type: integer
+                  description: maxTaskPoints
+                  minimum: 1
+                drainSeconds:
+                  type: integer
+                  minimum: 0
+                desiredState:
+                  type: string
+                  enum: ["Running", "Suspended"]
+                extraNoProxy:
+                  type: string
+                  description: >-
+                    NO_PROXY에 덧붙는 값. 어느 해시에도 포함되지 않는다
+                    (spec.go 주석: 토폴로지일 뿐이며 값이 바뀌어도
+                    컨테이너/Pod를 재생성할 이유가 아니다).
+                renderedPrompt:
+                  type: string
+                  description: "CLAUDE.md — :Role.promptTemplateMd 렌더 결과. ConfigHash 축."
+                renderedSettings:
+                  type: string
+                  description: "settings.json — permissions.allow/deny. ConfigHash 축."
+                renderedMCP:
+                  type: string
+                  description: "mcp.json — 게이트 도구 MCP 서버 정의. ConfigHash 축."
+                renderedAllowedTools:
+                  type: string
+                  description: "--allowedTools 인자 목록, 줄바꿈 구분. ConfigHash 축."
+                specHash:
+                  type: string
+                  description: >-
+                    ★ SpecHash와 ConfigHash는 의도적으로 분리되어 있다
+                    (10-core-architecture.md §6.2, orchestrator/internal/
+                    workload/spec.go ComputeHashes 주석 원문 그대로): "합치면
+                    프롬프트 한 줄 수정이 전 에이전트 재생성이 된다." 이
+                    필드가 바뀌면 operator가 Recreate(drain→delete→apply)
+                    한다 — image/resources/networkName/drainSeconds/
+                    concurrency만의 해시.
+                configHash:
+                  type: string
+                  description: >-
+                    ModelAlias + renderedPrompt/Settings/MCP/AllowedTools
+                    만의 해시. 이 필드가 바뀌면 operator가 ReloadConfig
+                    (무중단, 진행 중인 태스크는 건드리지 않고 다음 태스크
+                    부터 적용)한다 — specHash와 분리된 이유는 위 설명과
+                    동일.
+            status:
+              type: object
+              description: >-
+                OBSERVATION 계층(§6.1) — 드라이버/supervisor만 쓴다.
+                권위 있는 진실이 아니라 관측값이며, Neo4j :AgentRuntime에
+                미러링되는 쪽이 캐시다(반대가 아니다).
+              properties:
+                phase:
+                  type: string
+                  description: "§5.3 생명주기: Pending/Provisioning/Booting/Ready/Working/Draining/Stopped/Suspended/Failed"
+                podName:
+                  type: string
+                nodeName:
+                  type: string
+                sessionId:
+                  type: string
+                currentTaskId:
+                  type: string
+                lastHeartbeatAt:
+                  type: string
+                  format: date-time
+                restartCount24h:
+                  type: integer
+                observedSpecHash:
+                  type: string
+                  description: "operator가 마지막으로 Apply/Recreate에 성공한 spec.specHash 값."
+                observedConfigHash:
+                  type: string
+                  description: "operator가 마지막으로 ReloadConfig에 성공한 spec.configHash 값."
+                conditions:
+                  type: array
+                  description: "표준 K8s condition 배열 — Ready/GatewayReachable/CredentialsValid(§6.3)."
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

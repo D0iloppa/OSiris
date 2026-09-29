@@ -1,0 +1,272 @@
+# nats — JetStream. INBOX/TASKS/TRANSCRIPT/COST 스트림의 기반(§1.2 불변
+# 자산), §2 배치도.
+#
+# (a) nodeAffinity + (b) Guaranteed QoS/priorityClassName: core/neo4j
+#     StatefulSet과 동일한 근거(K4의 대가를 값으로 갚는다).
+# (c) Service 이름 고정("nats"): 에이전트가 아는 세 호스트명 중 하나
+#     (§1.2 불변자산 10번) — _helpers.tpl 상단 주석 참고.
+#
+# §7.2(70 문서 "새 항목")가 예고한 대로, nats.conf의 authorization{}은
+# osiris-orchestrator가 팀/에이전트 계정이 늘 때마다 다시 쓰는 동적
+# 파일이어야 한다(compose의 nats/generated/authorization.conf, 매 reconcile
+# tick마다 재기록 + SIGHUP). 그 재기록·리로드 메커니즘(operator가 ConfigMap
+# 을 patch하고 nats에 reload를 트리거하는 것, §7.2)은 Agent CRD/operator
+# (K9, C-3 범위)에 종속되므로 이번 phase에는 없다 — 여기서는 compose가
+# 커밋해 둔 "부트스트랩 기본값"(nats/generated/authorization.conf.example,
+# 플랫폼 정적 사용자 3개뿐, 에이전트 0명)과 동일한 내용을 ConfigMap으로
+# 고정 렌더링한다. 아래 TODO 참고.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-conf
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: nats
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+data:
+  nats.conf: |
+    // nats/nats.conf(compose)를 그대로 옮김 — 서브젝트 구조·스트림 정의는
+    // 10-core-architecture.md §7의 소관이며 여기서는 JetStream이 켜진
+    // 상태로 컨테이너가 healthy하게 뜨는 것만 책임진다.
+    server_name: osiris-nats
+    listen: 0.0.0.0:4222
+    http: 0.0.0.0:8222
+
+    jetstream {
+      store_dir: /data
+      max_memory_store: 1GB
+      max_file_store: 10GB
+    }
+
+    // nats-server의 include는 자기 자신(/etc/nats/nats.conf)이 있는
+    // 디렉터리를 기준으로 상대경로를 해석한다 — 절대경로를 쓰면 그
+    // 디렉터리 앞에 다시 붙어 실패한다(compose에서 이미 실측된 함정,
+    // nats/nats.conf의 원문 주석 참고). 그래서 여기도 상대경로("../")를
+    # 그대로 유지한다.
+    include "../nats-dynamic/authorization.conf"
+  authorization.conf: |
+    # GENERATED (부트스트랩 기본값) — 세 플랫폼 사용자(osiris-core/
+    # osiris-orchestrator/osiris-api)의 권한은 orchestrator/internal/natsauth/
+    # natsauth.go의 render()가 실제로 만들어내는 라이브 ACL과 **문자 그대로
+    # 동일**하게 맞춘다(그 파일이 authoritative source — 여기서 새로
+    # 발명하지 않는다). 팀/에이전트 계정(동적부)은 여전히 이 phase의
+    # 범위 밖이다 — 그 재기록 경로(operator가 이 ConfigMap을 patch하고
+    # nats에 reload를 거는 것)는 Agent CRD/operator(K9, C-3)가 구현될 때
+    # 추가된다.
+    #
+    # [2026-07-28 Phase D-3a 실측 수정] 이전 부트스트랩은 osiris-api에게
+    # `$JS.API.>`(전체 JetStream 관리 권한)를 줬는데, 이것은 natsauth.go
+    # render()의 §9.6 주석("osiris-api는 JetStream 관리 권한이 없어야
+    # 한다")을 정면으로 위반했다 — 그 결과 osiris-orchestrator도
+    # osiris-api도 진짜 필요한 권한(TASKS 컨슈머 생성 / security.>
+    # 발행)을 받지 못했다(osiris-orchestrator는 애초에 $JS.API.> 자체가
+    # 없었고, osiris-api는 $JS.API.>만 있고 security.>는 없었다). 아래는
+    # render()가 만드는 것을 그대로 옮긴 것 — 좁히면서 정확히 필요한
+    # 것만 준다.
+    #
+    # TODO(감독 판단 필요): C-3에서 operator가 이 ConfigMap을 실제로
+    # 갱신하려면 (1) ConfigMap patch 권한 RBAC과 (2) nats reload 트리거
+    # 방식(사이드카 reloader vs NATS 자체 hot-reload) 중 하나를 골라야
+    # 한다 — 70 §7.2가 이 선택을 이 문서 범위 밖으로 남겨 뒀다("k8s에서는
+    # 이 설정 파일이 ConfigMap이 되고, 리로드는 파일 변경 감지 방식으로
+    # 바뀐다"). 이번 phase는 그 선택을 하지 않고 정적 부트스트랩만 둔다.
+    #
+    # NOTE: 언쿼트($VAR) 참조를 쓴다 — nats-server가 파싱 시점에 자신의
+    # 컨테이너 환경변수로 치환한다(따옴표를 씌우면 리터럴 문자열이 되어
+    # 치환되지 않는다 — compose에서 이미 실측/수정된 함정, .example 원문
+    # 주석 참고). 아래 StatefulSet의 nats 컨테이너 env에 NATS_CORE_PASSWORD/
+    # NATS_ORCHESTRATOR_PASSWORD/NATS_API_PASSWORD를 secretKeyRef로 주는
+    # 이유가 이것이다 — nats-server 자신이 이 값들을 읽어 치환한다.
+    authorization {
+      users: [
+        { user: "osiris-core", password: $NATS_CORE_PASSWORD, permissions: {
+          publish: { allow: ["org.revision", "org.event.>", "$JS.API.STREAM.INFO.TASKS"] }
+          subscribe: { allow: ["_INBOX.>"] }
+        } }
+        { user: "osiris-orchestrator", password: $NATS_ORCHESTRATOR_PASSWORD, permissions: {
+          publish: { allow: ["agent.*.config.reload", "org.event.>", "$JS.API.>"] }
+          subscribe: { allow: ["org.revision", "_INBOX.>"] }
+        } }
+        { user: "osiris-api", password: $NATS_API_PASSWORD, permissions: {
+          publish: { allow: ["$JS.API.CONSUMER.CREATE.TASKS", "$JS.API.CONSUMER.DELETE.TASKS.*", "$JS.API.CONSUMER.INFO.TASKS.*", "$JS.API.CONSUMER.MSG.NEXT.TASKS.*", "$JS.API.STREAM.INFO.TASKS", "$JS.API.INFO", "$JS.API.STREAM.CREATE.KV_AUTHN_MACHINE", "$JS.API.STREAM.UPDATE.KV_AUTHN_MACHINE", "$JS.API.STREAM.INFO.KV_AUTHN_MACHINE", "$JS.API.STREAM.MSG.GET.KV_AUTHN_MACHINE", "$JS.API.DIRECT.GET.KV_AUTHN_MACHINE", "$JS.API.DIRECT.GET.KV_AUTHN_MACHINE.>", "$JS.API.CONSUMER.CREATE.KV_AUTHN_MACHINE", "$JS.API.CONSUMER.CREATE.KV_AUTHN_MACHINE.>", "$JS.API.CONSUMER.DELETE.KV_AUTHN_MACHINE.*", "$JS.API.CONSUMER.INFO.KV_AUTHN_MACHINE.*", "$JS.API.CONSUMER.MSG.NEXT.KV_AUTHN_MACHINE.*", "$KV.AUTHN_MACHINE.>", "$JS.API.STREAM.CREATE.KV_AUTHN_CRED", "$JS.API.STREAM.UPDATE.KV_AUTHN_CRED", "$JS.API.STREAM.INFO.KV_AUTHN_CRED", "$JS.API.STREAM.MSG.GET.KV_AUTHN_CRED", "$JS.API.DIRECT.GET.KV_AUTHN_CRED", "$JS.API.DIRECT.GET.KV_AUTHN_CRED.>", "$JS.API.CONSUMER.CREATE.KV_AUTHN_CRED", "$JS.API.CONSUMER.CREATE.KV_AUTHN_CRED.>", "$JS.API.CONSUMER.DELETE.KV_AUTHN_CRED.*", "$JS.API.CONSUMER.INFO.KV_AUTHN_CRED.*", "$JS.API.CONSUMER.MSG.NEXT.KV_AUTHN_CRED.*", "$KV.AUTHN_CRED.>", "$JS.API.STREAM.CREATE.KV_AUTHN_TICKET", "$JS.API.STREAM.UPDATE.KV_AUTHN_TICKET", "$JS.API.STREAM.INFO.KV_AUTHN_TICKET", "$JS.API.STREAM.MSG.GET.KV_AUTHN_TICKET", "$JS.API.DIRECT.GET.KV_AUTHN_TICKET", "$JS.API.DIRECT.GET.KV_AUTHN_TICKET.>", "$JS.API.CONSUMER.CREATE.KV_AUTHN_TICKET", "$JS.API.CONSUMER.CREATE.KV_AUTHN_TICKET.>", "$JS.API.CONSUMER.DELETE.KV_AUTHN_TICKET.*", "$JS.API.CONSUMER.INFO.KV_AUTHN_TICKET.*", "$JS.API.CONSUMER.MSG.NEXT.KV_AUTHN_TICKET.*", "$KV.AUTHN_TICKET.>", "security.machine.>", "security.rbac.>", "security.enrollment.>", "security.authn.>", "security.masterkey.>"] }
+          subscribe: { allow: ["_INBOX.>"] }
+        } }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # ★ [2026-07-28 실배포 실측 — 결함 2] 클라이언트용 ClusterIP Service.
+  #
+  # `_helpers.tpl`의 osiris.natsHeadlessServiceName 주석·neo4j-statefulset.yaml
+  # 의 동일 주석과 같은 근거 — 이 이름은 §1.2 불변자산 10번이 고정한
+  # 세 호스트명 중 하나이므로 특히 이 이름이 항상 풀려야 한다(에이전트
+  # 이미지가 소스에서 이 이름을 하드코딩한다). headless였을 때는
+  # nats-0이 Ready가 되기 전까지 이 이름 자체가 존재하지 않아 osiris-core/
+  # osiris-orchestrator가 (neo4j와 같은 이유로) DNS 실패로 죽었다.
+  name: {{ include "osiris.natsServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: nats
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # governing headless Service — StatefulSet.spec.serviceName 전용.
+  # neo4j-statefulset.yaml의 동일 패턴 참고.
+  name: {{ include "osiris.natsHeadlessServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: nats
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/component: nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: nats
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "osiris.natsHeadlessServiceName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: nats
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: nats
+    spec:
+      priorityClassName: osiris-core-critical
+      {{- include "osiris.mainNodeAffinity" . | nindent 6 }}
+      containers:
+        - name: nats
+          image: "{{ .Values.images.nats.repository }}:{{ .Values.images.nats.tag }}"
+          imagePullPolicy: {{ .Values.images.nats.pullPolicy }}
+          # ★ [2026-07-28 실배포 실측] `args:`이며 `command:`가 아니다.
+          #
+          # compose의 `command:`는 docker CMD이고, docker CMD는 ENTRYPOINT에
+          # 넘기는 **인자**다. k8s의 `command:`는 ENTRYPOINT 자체를 덮어쓴다.
+          # 그래서 compose의 `command: ["-c", ...]`를 k8s `command:`로 그대로
+          # 옮기면 컨테이너가 `-c`라는 이름의 실행파일을 찾다 죽는다 — 로그가
+          # 한 줄도 남지 않아 원인이 보이지 않는다(실측: nats-0 CrashLoopBackOff,
+          # `kubectl logs`가 빈 출력).
+          #
+          # 이 이미지의 ENTRYPOINT는 `docker-entrypoint.sh`이고 CMD는
+          # `["nats-server","--config","/etc/nats/nats-server.conf"]`다(실측).
+          # 우리는 다른 설정 경로를 쓰므로 CMD만 바꾼다 → `args:`.
+          args: ["nats-server", "-c", "/etc/nats/nats.conf"]
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitor
+              containerPort: 8222
+          env:
+            # nats-server 자신이 authorization.conf의 $VAR을 파싱 시점에
+            # 치환한다(위 ConfigMap 주석 참고) — osiris-orchestrator가
+            # 갖는 것과 같은 값이어야 각 플랫폼 컴포넌트의 NATS_URL이
+            # 맞물린다.
+            - name: NATS_CORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_CORE_PASSWORD
+            - name: NATS_ORCHESTRATOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_ORCHESTRATOR_PASSWORD
+            - name: NATS_API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "osiris.secretName" . }}
+                  key: NATS_API_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: nats-conf
+              mountPath: /etc/nats
+              readOnly: true
+            - name: nats-dynamic
+              mountPath: /etc/nats-dynamic
+              readOnly: true
+          # ★ [2026-07-28 실배포 실측 — 결함 3] startupProbe 신설(neo4j와
+          # 같은 이유 — core-statefulset.yaml/neo4j-statefulset.yaml 상단
+          # 주석 참고: compose healthcheck 실패는 컨테이너를 안 죽이지만
+          # k8s liveness 실패는 죽인다). compose 예산(start_period:10s,
+          # interval:10s, retries:5 → 10+50=60초)에 여유를 더해 80초로 잡음.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            periodSeconds: 10
+            failureThreshold: 8
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.resources.nats.cpu | quote }}
+              memory: {{ .Values.resources.nats.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.nats.cpu | quote }}
+              memory: {{ .Values.resources.nats.memory | quote }}
+      volumes:
+        - name: nats-conf
+          configMap:
+            name: nats-conf
+            items:
+              - key: nats.conf
+                path: nats.conf
+        - name: nats-dynamic
+          configMap:
+            name: nats-conf
+            items:
+              - key: authorization.conf
+                path: authorization.conf
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/component: nats
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storage.nats.storageClassName }}
+        storageClassName: {{ .Values.storage.nats.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.nats.size }}

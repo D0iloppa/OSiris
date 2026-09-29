@@ -1,0 +1,121 @@
+# RBAC for osiris-orchestrator (= Agent CRD operator, K9).
+#
+# ★ 이 파일의 요점은 "무엇을 주는가"가 아니라 "무엇을 안 주는가"다.
+#
+# osiris-orchestrator가 실제로 만들어야 하는 것은 K5가 이미 정한 목록뿐
+# 이다 — "직원 1명 = Pod 1개 + PVC·SA·Secret·NetworkPolicy"(70 §0 K5).
+# 그 다섯 종류 리소스 + Agent CR 자신(spec 전체 + status 서브리소스) 이상은
+# 아무것도 주지 않는다. 특히:
+#
+#   - ClusterRole이 아니라 **Role**(osiris-agents 네임스페이스에 한정)이다.
+#     Agent CR은 K10에 의해 osiris-agents에만 존재하므로(namespaced, 다른
+#     네임스페이스에 놓일 수 없다는 것이 K10의 기술적 강제) operator가
+#     Agent를 watch/list하는 데도 ClusterRole이 필요 없다 — 단일 고정
+#     네임스페이스에 대한 Role로 충분하다.
+#   - osiris-system에는 이 Role이 워크로드 생성 권한을 전혀 주지 않는다
+#     (아래 두 번째 매니페스트가 leases/events만 별도로, 아주 좁게 준다).
+#     G8("core/api/orchestrator 중 docker.sock=워크로드 생성 권한을 갖는
+#     것은 오직 orchestrator뿐"이었던 compose 시절 경계)의 k8s 대응은
+#     "orchestrator의 워크로드 생성 권한을 osiris-agents 하나로 좁힌다"는
+#     것이다 — osiris-system 자신의 파드(core/api/omniroute/egress 등)를
+#     조작할 권한까지 주면 그 경계가 다시 넓어진다.
+#   - Team/PermissionProfile CRD(§6.3이 스케치한 나머지 2종)에 대한 권한은
+#     아예 없다 — 이번 phase(C-3a)가 만드는 CRD는 Agent 하나뿐이므로
+#     (작업 지시 범위), 짓지 않은 권한을 미리 주지 않는다.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: osiris-orchestrator
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+---
+# osiris-agents 네임스페이스 Role — 실제 워크로드 관리 권한 전부가 여기
+# 있다. K5가 나열한 다섯 종류(Pod/PVC/SA/Secret/NetworkPolicy) + Agent CR
+# 자신(spec 전체 create/get/list/watch/update/patch/delete) + agents/status
+# 서브리소스(status는 operator 자신도 쓴다 — observedSpecHash/
+# observedConfigHash/conditions를 채우는 것은 reconcile 루프 자신이다).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: osiris-agent-operator
+  namespace: {{ include "osiris.agentsNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "serviceaccounts", "secrets"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["osiris.dev"]
+    resources: ["agents"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["osiris.dev"]
+    resources: ["agents/status"]
+    verbs: ["get", "update", "patch"]
+---
+# 크로스-네임스페이스 바인딩: RoleBinding 자신은 대상 네임스페이스
+# (osiris-agents, roleRef가 사는 곳)에 있고, subject는 다른 네임스페이스
+# (osiris-system)의 ServiceAccount를 가리킨다 — K8s RBAC이 명시적으로
+# 지원하는 패턴이다(ClusterRole을 쓰지 않고도 SA가 다른 네임스페이스의
+# 리소스를 다룰 수 있는 유일한 방법).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: osiris-agent-operator
+  namespace: {{ include "osiris.agentsNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: osiris-orchestrator
+    namespace: {{ include "osiris.systemNamespace" . }}
+roleRef:
+  kind: Role
+  name: osiris-agent-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+# osiris-system 네임스페이스 Role — operator 자신의 운영 부기(leader
+# election lease, 이벤트 기록)만. 이것은 워크로드 생성 권한이 **아니다**
+# — Lease/Event는 controller-runtime 매니저가 자기 자신의 활동 상태를
+# 기록하는 부수 오브젝트이지, Pod/Deployment 같은 워크로드가 아니다.
+# G8/"osiris-system에는 워크로드 생성 권한을 주지 않는다"는 경계와
+# 충돌하지 않는 이유가 바로 이것 — 여기 나열된 두 리소스 중 어느 것도
+# 실행 가능한 워크로드를 만들지 못한다.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: osiris-orchestrator-bookkeeping
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: osiris-orchestrator-bookkeeping
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: orchestrator
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: osiris-orchestrator
+    namespace: {{ include "osiris.systemNamespace" . }}
+roleRef:
+  kind: Role
+  name: osiris-orchestrator-bookkeeping
+  apiGroup: rbac.authorization.k8s.io

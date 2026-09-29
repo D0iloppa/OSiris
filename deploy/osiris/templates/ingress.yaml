@@ -1,0 +1,442 @@
+# Ingress — K3(70 §3.3): "진입점은 Ingress Controller 단독. 콘솔 SPA는
+# 자기 파드(nginx)가 서빙. osiris-gw 폐지." 경로 분기는 gw/conf.d/
+# default.conf가 하던 것을 그대로 옮긴다(I5 3차 수정의 블랙리스트 설계:
+# OSiris가 예약한 몇 경로만 빼고 나머지 전부는 omniroute로).
+#
+# ★★★ SSE 대응표 (`IMPLEMENTATION-NOTES.md` §108.1 실측 확정값 ↔
+# ingress-nginx annotation) ★★★
+#
+#   nginx 지시어(gw/conf.d/default.conf, §108.1 실측)  | ingress-nginx annotation
+#   ---------------------------------------------------|--------------------------------------------------
+#   proxy_buffering off;                                | nginx.ingress.kubernetes.io/proxy-buffering: "off"
+#   proxy_cache off;                                     | (ingress-nginx는 명시적으로 켜지 않는 한 업스트림
+#                                                        |  캐시가 기본 off — 그래도 실수로 켜질 경로를 닫기
+#                                                        |  위해 configuration-snippet에 `proxy_cache off;`를
+#                                                        |  명시적으로 반복한다)
+#   proxy_read_timeout 3600s;                            | nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+#   proxy_send_timeout 3600s;  (D20 표에도 있음, 짝값)     | nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+#   proxy_http_version 1.1; + Connection "";              | configuration-snippet (전용 annotation 없음 —
+#                                                        |  ingress-nginx 템플릿 기본값이 이미 1.1이지만 §108.1이
+#                                                        |  실측 확정한 값이므로 우연에 맡기지 않고 명시한다)
+#   chunked_transfer_encoding on; gzip off;               | configuration-snippet (동일 이유)
+#
+# 이 표가 채우는 것은 `/_api/`(osiris-api, `/_api/events` SSE 포함)와
+# `/omni/`(omniroute, 채팅 스트리밍) 두 Ingress뿐이다 — 콘솔 정적 자산
+# Ingress에는 SSE 설정이 필요 없다.
+#
+# 컨트롤러 종류는 70 §8이 미결로 남긴 항목이라 `.Values.ingress.controller`
+# 로 분기한다(nginx만 채움, traefik은 TODO). 다른 값이 들어오면 조용히
+# annotation 없는 Ingress를 렌더링하지 않도록 `fail`로 막는다 — SSE가
+# 깨진 채로 배포되는 것보다 설치 실패가 낫다.
+
+{{- if .Values.ingress.enabled }}
+{{- if not (eq .Values.ingress.controller "nginx") }}
+{{- /* 컨트롤러 검증을 여기서 한 번만 한다. 미지원 값이 들어오면 조용히
+     Ingress를 0개 렌더하는 것이 아니라 설치를 실패시킨다 — SSE가 깨진 채
+     배포되는 것보다 설치 실패가 낫다(70 §8 미결). */}}
+{{- fail (printf "ingress.controller=%q 는 지원하지 않습니다 (nginx만 구현됨). 70 §8 미결." .Values.ingress.controller) }}
+{{- end }}
+{{- end }}---
+{{- if .Values.ingress.enabled }}
+# osiris-console Ingress — 루트 하나(`/$`)만 잡는다.
+#
+# ★ [2026-07-28 실배포 실측 — 이 함정의 최초 기록] 초판은 `Exact /` +
+# `Prefix /assets/` + `Prefix /brand/` + `Exact /pre-status` + 정규식 favicon
+# 다섯 경로에 `use-regex: "true"`를 걸었고, 그 조합이 라우팅을 망가뜨렸다:
+#
+#   use-regex가 켜지면 ingress-nginx는 `pathType: Exact`조차 정규식 location으로
+#   렌더한다(실측: 생성된 nginx.conf에 `location = /`가 없고 `location ~* "^/"`만
+#   두 개 있었다). nginx에서 `= /`는 최우선이지만 `~* "^/"`는 그 우선순위를 잃고,
+#   `/`가 omniroute catchall로 새거나 default backend로 떨어져 404/502가 됐다.
+#
+# 그때의 대응은 "경로를 `Prefix /` 하나로 줄이고 catch-all을 끈다"였다. 그것으로
+# 증상은 사라졌지만 **서브 URL 배포가 함께 죽었다** — omniroute가 루트 절대경로로
+# 보내는 요청(`POST /api/auth/login` 등)을 받아 줄 규칙이 사라졌기 때문이다
+# (2026-09-11에 로그인 불능으로 관측, 아래 catch-all 블록 주석 참고).
+#
+# ★ [2026-09-11] 같은 함정을 다시 밟고, 이번엔 원인을 정확히 짚어 해결했다.
+# 문제는 "Exact가 정규식이 된다"가 아니라 **경로 문자열 길이가 동률이 된다**는
+# 것이었다. ingress-nginx는 location을 경로 길이 내림차순으로 정렬하는데,
+# 콘솔의 `/`와 컨트롤러 기본 백엔드의 `/`가 둘 다 길이 1이라 순서가 우연에
+# 맡겨졌고, 기본 백엔드가 앞서면 `GET /`가 404가 된다.
+#
+# 해법은 우선순위 규칙과 싸우는 것이 아니라 **동률을 만들지 않는 것**이다:
+# 루트를 `/$`(길이 2)로 쓰면 기본 백엔드(1)보다 앞서고 catch-all `/(.+)`(6)보다
+# 뒤에 오며, `^/$`는 루트 하나만 매칭하므로 catch-all과 겹치지도 않는다.
+#
+# 정적 자산(`/assets/`·`/brand/`·favicon)은 1-b번 Ingress가 따로 예약한다 —
+# catch-all이 있는 이상 Ingress 레벨에서 예약하지 않으면 콘솔 파드까지
+# 도달하지도 못하기 때문이다(그 블록 주석 참고). 초판이 "콘솔 파드의 nginx가
+# 이미 갖고 있으니 중복"이라고 본 것은 `/` Prefix 하나가 전부를 콘솔로 보내던
+# 동안에만 참이었다.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "osiris.consoleServiceName" . }}
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if and .Values.ingress.host .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tlsSecretName | quote }}
+  {{- end }}
+  rules:
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host | quote }}
+      {{- end }}
+      http:
+        paths:
+          # ★ [2026-09-11] `/`(Prefix) → `/$`(정규식). 이 한 글자가 catch-all을
+          # 되살릴 수 있게 만든 것이다.
+          #
+          # 콘솔은 순수 React state 라우팅이라 `/` 밖의 최상위 경로를 쓰지
+          # 않는다(console/README.md) — 그래서 루트 **하나만** 잡으면 되고,
+          # 이건 gw/conf.d/default.conf가 `location = /`로 내린 것과 같은 판단이다.
+          #
+          # 왜 `pathType: Exact`가 아닌가 — **시도했고 실패했다(실측).**
+          # Exact를 쓰면 `location = /`가 나올 것으로 기대했지만, 이 컨트롤러
+          # (ingress-nginx v1.11.3)는 같은 서버에 정규식 Ingress가 있으면 Exact도
+          # 정규식 `~* "^/"`로 내보낸다. 그리고 ingress-nginx는 **자기 기본
+          # 백엔드용 `location ~* "^/"`를 하나 더** 만드는데, 경로 문자열이 둘 다
+          # `/`(길이 1)로 동률이라 정렬에서 기본 백엔드가 앞서 버렸다 — 결과는
+          # `GET /` → 404. 동률은 우연에 맡기는 것이고, 우연은 졌다.
+          #
+          # `/$`는 길이 2라 기본 백엔드의 `/`(1)보다 확실히 앞서고, catch-all
+          # `/(.+)`(6)보다는 뒤에 온다. 그리고 `^/$`는 루트 **하나만** 매칭하므로
+          # catch-all이 아무리 넓어도 겹치지 않는다. 정렬 규칙에 기대되, **동률을
+          # 만들지 않는 것**이 요령이다.
+          - path: /$
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.consoleServiceName" . }}
+                port:
+                  number: 80
+{{- end }}
+---
+# -------------------------------------------------------------------------
+# 1-b) osiris-console 정적 자산 — `/assets/`·`/brand/`·브랜드 마크.
+#
+# ★ [2026-09-11 신설] catch-all(4번)을 켜면서 **반드시 함께 생겨야 하는**
+# Ingress다. 초판은 "콘솔 파드의 nginx가 이미 이 규칙들을 갖고 있으니 Ingress에
+# 중복할 이유가 없다"고 적었고, `/` Prefix 하나가 모든 것을 콘솔로 보내던
+# 동안에는 그 말이 맞았다. catch-all이 켜지면 더 이상 맞지 않는다 — `/assets/
+# index-*.js`가 `^/(.*)`에 걸려 omniroute로 가 버린다. 콘솔 파드의 nginx는
+# 요청이 거기까지 도달해야 의미가 있고, 어느 파드로 보낼지는 Ingress만이
+# 결정한다.
+#
+# 파일명이 아니라 **접두사/패턴으로 예약**한다 — gw/conf.d/default.conf가
+# 브랜드 마크를 파일명으로 열거했다가 변형 3종이 추가되자 404가 났던 사고를
+# 주석으로 남겨 뒀고, vite 해시 파일명은 매 빌드 바뀌므로 열거는 반드시 깨진다.
+#
+# 확장자 기준(`\.svg$` 등)으로 넓히지 말 것 — omniroute 자신의
+# `/providers/*.png` 같은 정적 파일까지 가로챈다(같은 주석의 경고 그대로).
+#
+# 길이 정렬로 catch-all보다 먼저 매칭된다: favicon 패턴(26) · `/assets/(.*)`(12)
+# · `/brand/(.*)`(11) 모두 `/(.+)`(6)보다 길다.
+#
+# catch-all 플래그로 **게이트하지 않는다**. 1번 블록의 콘솔 루트가 `/$`(루트 하나)
+# 로 좁아진 이상, 이 Ingress는 catch-all이 꺼져 있어도 필요하다 — 없으면
+# `/assets/*`를 받아 줄 규칙이 아무것도 없다.
+# -------------------------------------------------------------------------
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: osiris-console-assets
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if and .Values.ingress.host .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ .Values.ingress.tlsSecretName | quote }}
+  {{- end }}
+  rules:
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: /(favicon|osiris-mark)[^/]*
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.consoleServiceName" . }}
+                port:
+                  number: 80
+          - path: /assets/(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.consoleServiceName" . }}
+                port:
+                  number: 80
+          - path: /brand/(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.consoleServiceName" . }}
+                port:
+                  number: 80
+{{- end }}
+---
+# -------------------------------------------------------------------------
+# 2) osiris-api — `/_api/` (구 `/api/`, gw가 벗겨서 넘기던 것과 동일하게
+#    여기서도 `/_api/(.*)` -> `/api/$1`로 rewrite). `/_api/events`(SSE)도
+#    이 prefix 블록 설정을 그대로 상속한다(원본 default.conf와 동일 구조).
+# -------------------------------------------------------------------------
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: osiris-api
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: api
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    # gw/conf.d/default.conf와 동일한 이유로 rewrite ... break; 대신
+    # 캡처 그룹을 쓴다 — ingress-nginx의 rewrite-target은 path의 정규식
+    # 캡처 그룹을 $1, $2...로 참조한다.
+    nginx.ingress.kubernetes.io/rewrite-target: /api/$2
+    # --- SSE (§108.1 실측값, 위 대응표) ---
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {{- if .Values.ingress.useConfigurationSnippet }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_cache off;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      chunked_transfer_encoding on;
+      gzip off;
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if and .Values.ingress.host .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  {{- end }}
+  rules:
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host }}
+      {{- end }}
+      http:
+        paths:
+          - path: /_api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.apiServiceName" . }}
+                port:
+                  number: 8443
+{{- end }}
+---
+# -------------------------------------------------------------------------
+# 3) osiris-omniroute — `/omni`(정확히, 트레일링 슬래시 없음, omniroute
+#    자신이 리다이렉트하는 실측 경로) · `/omni/`(이미 접두사 있음, 그대로
+#    전달) · 그 외 전부(블랙리스트 catch-all, `/omni` 접두사를 붙여 전달).
+#    ingress-nginx는 같은 host의 여러 Ingress 리소스를 병합하면서 경로
+#    특이도(더 긴/더 구체적인 경로 우선)로 정렬하므로, 위 콘솔/api
+#    Ingress의 예약 경로가 이 catch-all보다 먼저 매칭된다 — default.conf의
+#    location 우선순위와 동일한 성질.
+# -------------------------------------------------------------------------
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: osiris-omniroute
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: omniroute
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    # catch-all 규칙만 `/omni` 접두사를 붙인다 — `/omni`·`/omni/` 두 exact/
+    # prefix 규칙은 rewrite 없이 그대로 전달한다(default.conf와 동일하게
+    # "이미 접두사가 있는 요청은 다시 붙이지 않는다"). ingress-nginx는
+    # Ingress 오브젝트 하나에 rewrite-target을 하나만 가질 수 있어, 이
+    # 셋을 한 오브젝트에 넣으면 `/omni`·`/omni/`에도 같은 rewrite가
+    # 적용되어 이중 접두사가 된다 — 그래서 catch-all은 별도 Ingress(4번)
+    # 로 분리했다.
+    #
+    # --- SSE (§108.1 실측값, 위 대응표) — omniroute도 채팅 토큰 스트리밍
+    # 을 쓴다(default.conf의 `location /omni/`와 동일 근거) ---
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {{- if .Values.ingress.useConfigurationSnippet }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_cache off;
+      proxy_http_version 1.1;
+      chunked_transfer_encoding on;
+      gzip off;
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if and .Values.ingress.host .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  {{- end }}
+  rules:
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host }}
+      {{- end }}
+      http:
+        paths:
+          # ★ [2026-09-11] `/omni` Exact + `/omni/` Prefix 두 개를 정규식
+          # 하나로 합쳤다. 이유는 **길이 정렬**이다.
+          #
+          # ingress-nginx는 같은 host의 location들을 **경로 문자열 길이 내림차순**
+          # 으로 내보내고(실측: 컨트롤러 nginx.conf), 정규식 location은 정의 순서대로
+          # 먼저 매칭되는 쪽이 이긴다. 구 표기의 `/omni/`는 길이 6이고 catch-all
+          # `/(.*)`도 길이 6이라 **동률**이다 — 동률의 순서는 보장되지 않고, 만약
+          # catch-all이 앞서면 `/omni/login`이 `/omni/omni/login`으로 이중 접두사가
+          # 된다. 우연에 맡길 수 없는 자리다.
+          #
+          # `/omni(/|$)(.*)`는 길이 14라 `/(.*)`(6)를 확실히 앞선다. 패턴 자체는
+          # 위 osiris-api의 `/_api(/|$)(.*)`와 같은 관용구이고, 트레일링 슬래시가
+          # 없는 `/omni`(omniroute 자신이 리다이렉트하는 실측 경로)와 있는
+          # `/omni/` 둘 다를 `(/|$)`로 덮는다.
+          #
+          # 이 Ingress에는 rewrite-target이 **없다** — 그래서 ingress-nginx가
+          # 원본 URI를 그대로 전달한다(이미 `/omni` 접두사가 붙어 온 요청에
+          # 다시 붙이지 않는다는 default.conf의 규율 그대로).
+          - path: /omni(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.omnirouteServiceName" . }}
+                port:
+                  number: 20128
+{{- end }}
+---
+{{- if and .Values.ingress.enabled .Values.ingress.omnirouteCatchAll }}
+# ★ [2026-09-11] 이 catch-all은 이제 **기본 활성**이다. 아래는 2026-07-28에
+# 이것을 끄면서 적었던 두 가지 사유이고, 둘 다 관측으로 반증됐다.
+#
+# ── 반증된 사유 1: "이 catch-all이 실제로 필요한지 불확실하다" ──
+# 초판의 추론은 "`OMNIROUTE_BASE_PATH=/omni`가 구워져 있으니 omniroute의 라우트는
+# 전부 `/omni/` 아래에 있고, 따라서 `/omni/` Ingress 하나로 충분할 것"이었다.
+# **틀렸다.** Next.js의 basePath는 `next/link`·라우터·정적 에셋(`/_next/...`)에만
+# 자동 적용되고, **코드 안의 리터럴 절대경로 문자열에는 붙지 않는다.**
+#
+# 2026-09-11 실측(감독): `/omni/login` 화면은 정상으로 뜨는데 로그인 버튼이
+# 아무 일도 하지 않는다. 브라우저가 `POST /api/auth/login`(루트!)으로 보내고,
+# 그것을 받아줄 규칙이 Ingress에 없어 `/`(콘솔)로 떨어졌기 때문이다. 이 이미지의
+# `src`에서 리터럴 `"/api/`를 쓰는 파일이 **298개**이고, 중앙 API 헬퍼
+# (`shared/utils/api.ts`)는 basePath를 붙이지 않는 얇은 fetch 래퍼라 한 곳을
+# 고쳐서 될 일이 아니다 — 이것이 compose의 gw가 애초에 화이트리스트가 아니라
+# **블랙리스트**(예약 경로 몇 개만 빼고 전부 omniroute)로 설계된 바로 그 이유다
+# (gw/conf.d/default.conf 헤더 주석 "I5 3차 수정" 참고). 초판이 옮기지 않은 것은
+# 선택이 아니라 누락이었다.
+#
+# ── 반증된 사유 2: "켜면 콘솔의 `/`를 삼킨다(GET / → 502)" ──
+# 이건 **관측 자체는 정확했지만 원인 진단이 틀렸다.** 원인은 catch-all이 넓어서가
+# 아니라, 당시 콘솔 Ingress의 `/`가 `pathType: Prefix`여서 ingress-nginx가 그것을
+# 정규식 `~* "^/"`로 내보냈기 때문이다 — 정규식 둘이 순서 싸움을 벌인 것이다.
+# 콘솔을 `pathType: Exact`로 바꾸면 `location = /`가 되고, nginx에서 정확히 일치는
+# **모든 정규식보다 무조건 우선**하므로 충돌 자체가 성립하지 않는다(1번 블록 주석).
+# "콘솔을 서브패스나 별도 host로 옮겨야 한다"는 결론도 따라서 불필요하다 —
+# 감독이 명시한 제약(서브도메인을 매번 발행하지 않는다, 서브 URL로 해결한다)과
+# 정면으로 충돌하던 결론이었는데, 애초에 그럴 필요가 없었다.
+#
+# ── 이 catch-all이 성립하기 위한 전제 (셋 다 위에서 만족시켰다) ──
+#   (1) 콘솔 루트가 `/$` 정규식(동률 회피) — 1번 블록
+#   (2) 콘솔 정적 자산이 별도 예약 경로   — 1-b번 블록 (없으면 /assets/*를 뺏긴다)
+#   (3) omniroute 통과 경로가 catch-all보다 길다 — 3번 블록 `/omni(/|$)(.*)`
+#   (4) catch-all이 `(.*)`가 아니라 `(.+)`  — 아래 path 주석
+#
+# 생성되는 location 순서(경로 길이 내림차순, 실측으로 확인할 것):
+#   ~* ^/(favicon|osiris-mark)[^/]*  → console   (26)
+#   ~* ^/omni(/|$)(.*)               → omniroute (14, rewrite 없음)
+#   ~* ^/_api(/|$)(.*)               → api       (14, `/api/$2`로 rewrite)
+#   ~* ^/assets/(.*)                 → console   (12)
+#   ~* ^/brand/(.*)                  → console   (11)
+#   ~* ^/(.+)                        → omniroute (6, `/omni/$1`로 rewrite)
+#   ~* ^/$                           → console   (2, 루트 하나)
+#   ~* ^/                            → ingress-nginx 기본 백엔드 (1, 404)
+#
+# 위 표는 추측이 아니라 컨트롤러의 /etc/nginx/nginx.conf를 실제로 덤프해서 확인한
+# 순서다. 경로를 하나라도 고치면 **길이가 바뀌어 순서가 바뀔 수 있으므로** 다시
+# 덤프해 확인할 것.
+#
+# false로 되돌리면 서브 URL 배포에서 omniroute 로그인이 다시 깨진다 — 끄기 전에
+# 위 "반증된 사유"를 다시 읽을 것.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: osiris-omniroute-catchall
+  namespace: {{ include "osiris.systemNamespace" . }}
+  labels:
+    app.kubernetes.io/component: omniroute
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /omni/$1
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    {{- if .Values.ingress.useConfigurationSnippet }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_cache off;
+      proxy_http_version 1.1;
+      chunked_transfer_encoding on;
+      gzip off;
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if and .Values.ingress.host .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  {{- end }}
+  rules:
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host }}
+      {{- end }}
+      http:
+        paths:
+          # ★ [2026-09-11 실측] `(.*)`가 아니라 `(.+)`다 — 한 글자가 콘솔의
+          # 루트를 살린다. `^/(.*)`는 빈 나머지도 매칭하므로 `GET /`까지 삼켜
+          # omniroute로 보내 버린다(실측: `/` → 308, omniroute가 자기 basePath로
+          # 리다이렉트). `^/(.+)`는 `/` 뒤에 최소 한 글자를 요구하므로 루트를
+          # 건드리지 않고, 루트는 위 `^/$`(콘솔)로 떨어진다.
+          - path: /(.+)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: {{ include "osiris.omnirouteServiceName" . }}
+                port:
+                  number: 20128
+{{- end }}

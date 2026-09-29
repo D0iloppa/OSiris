@@ -1,0 +1,17 @@
+{
+  "name": "mcp-infra",
+  "version": "0.1.0",
+  "description": "mcp__infra__* — read-only MCP tools over osiris-api's /_api/infra/* topology surface (docs/design/90-infra-topology.md §7.1/§7.2 B단계)",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "mcp-infra": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}

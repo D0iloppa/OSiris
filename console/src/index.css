@@ -1,0 +1,54 @@
+/*
+ * OSiris 콘솔 글로벌 리셋.
+ * 라이트 전용(41 §4/§8 — 다크는 지금 설계하지 않는다. 과잉설계 금지).
+ * 색·타이포·간격 값은 전부 src/theme/tokens.ts에서 온다 — 여기 리터럴 hex를
+ * 새로 쓰지 않는다(antd ConfigProvider가 --ant-* 변수를, applyCssVars()가
+ * --osiris-* 변수를 주입한 뒤 이 파일이 그 변수만 참조한다).
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--ant-color-text);
+  background: var(--ant-color-bg-layout);
+  font-family: var(--ant-font-family);
+  font-size: var(--ant-font-size);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--osiris-font-mono);
+}
+
+/* 페이지당 1500 max-width 규칙 — PageHeader/컨텐츠 공용 (41 §5.3) */
+.osiris-content-max {
+  max-width: 1500px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* 사이드바 반응형 — <900px 숨김 (41 §5.1, 10명 미만 내부 도구라 모바일
+   최적화는 범위 밖) */
+@media (max-width: 899px) {
+  .osiris-sidebar {
+    display: none;
+  }
+}

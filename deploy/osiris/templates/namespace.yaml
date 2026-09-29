@@ -1,0 +1,46 @@
+# K4/K5 — 네임스페이스 분리 그 자체 (§2 배치도).
+#
+# osiris-system: 코어 고정 워크로드(core/api/orchestrator/omniroute/egress
+#   + neo4j/nats) — §9 토폴로지의 "nodeAffinity: osiris.dev/role=main" 박스.
+# osiris-agents: 직원 1명 = Pod 1개 + PVC/SA/Secret/NetworkPolicy가 사는
+#   자유 배치 네임스페이스(K5) — Agent CR도 여기(K10, ownerReference가
+#   네임스페이스를 못 넘으므로).
+#
+# 이 분리가 §3(NetworkPolicy)·C-3(RBAC/Agent CRD)의 전제 조건이지만, 그
+# 둘은 이번 phase 범위가 아니다 — 여기서는 네임스페이스 오브젝트만 만든다.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "osiris.systemNamespace" . }}
+  labels:
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "osiris.agentsNamespace" . }}
+  labels:
+    {{- include "osiris.commonLabels" . | nindent 4 }}
+    # [2026-09-11] 90-infra-topology.md PodSecurity blocker — 실집행 개시.
+    #
+    # 배경(T1 실측): `10-core §169`가 PodSecurity를 k8s 격리 보증자로 적었으나
+    # 이 네임스페이스에는 enforce 라벨이 실제로 **없었다**(미집행). 그 공백을
+    # 여기서 닫는다.
+    #
+    # 레벨 선택 — enforce=baseline, warn/audit=restricted:
+    #   - 에이전트는 설계상 restricted 준수 대상이다(§82: no-new-privileges,
+    #     cap_drop ALL, read_only, non-root). 그러나 restricted는
+    #     seccompProfile=RuntimeDefault 등 추가 필드를 요구하는데, orchestrator가
+    #     생성하는 파드 스펙이 그 전부를 채우는지 이 문서 범위에서 실측하지
+    #     못했다. enforce=restricted로 바로 올렸다가 에이전트 **생성 자체가
+    #     거부**되면 런타임이 죽는다.
+    #   - 그래서 enforce는 **baseline**(privileged·hostNetwork·hostPath·hostPID
+    #     등 진짜 위험을 차단 — 미집행이던 공백을 실질적으로 닫음)로 두고,
+    #     restricted는 **warn+audit**로 걸어 위반을 깨지 않고 드러낸다.
+    #   - enforce=restricted로의 승격은 orchestrator 파드 시큐리티 컨텍스트를
+    #     실측 검증한 뒤의 후속 과제다(90 §8).
+    # 현재 osiris-agents에 파드가 0개라(실측) 이 라벨 추가는 기존 워크로드를
+    # 깨지 않는다 — 신규 파드에만 적용된다.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

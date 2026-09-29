@@ -1,0 +1,29 @@
+# --- 실제 시크릿/런타임 상태. 절대 커밋하지 않는다 (§8.4) ---
+.env
+state/
+!state/.gitkeep
+
+# osiris-orchestrator가 실제 NATS 비밀번호(플랫폼 + 에이전트별)를 이 파일에
+# 평문으로 써 넣는다(§7.3/D14, internal/natsauth). 커밋하는 것은 항상
+# authorization.conf.example(플레이스홀더 $VAR)뿐이다.
+nats/generated/authorization.conf
+
+# --- 빌드 산출물 ---
+console/dist/
+gw/html/status.json
+
+# --- 일반 ---
+*.log
+.DS_Store
+
+# --- 2026-09-29 git 이력 확보 시 추가 ---
+# 시크릿 사본(.env 백업 등) — .env.example만 커밋
+.env.*
+!.env.example
+*.bak
+deploy/osiris/values-secret*.yaml
+# 호스트 고유 배포값(도메인·브리지 IP 등) — 공개 저장소에 두지 않는다
+deploy/osiris/values-local*.yaml
+# 의존성·대용량 바이너리
+node_modules/
+go*.linux-amd64.tar.gz
